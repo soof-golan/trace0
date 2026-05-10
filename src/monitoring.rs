@@ -2,8 +2,10 @@ use crate::evqueue::EventQueue;
 use crate::event::{Event, EventKind, now_us, os_tid};
 use crate::intern::Interner;
 use crate::threads::ThreadRegistry;
+use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
+use std::ffi::CStr;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -15,11 +17,11 @@ pub struct State {
 }
 
 #[inline]
-fn record(py: Python<'_>, state: &State, code: &Bound<'_, PyAny>, kind: EventKind) {
+fn record(py: Python<'_>, state: &State, code: pyo3::Borrowed<'_, '_, PyAny>, kind: EventKind) {
     let key = code.as_ptr() as usize;
     let code_id = match state.interner.lookup(key) {
         Some(id) => id,
-        None => state.interner.insert(py, code, key),
+        None => state.interner.insert(py, &code, key),
     };
 
     let tid = os_tid();
@@ -38,55 +40,87 @@ pub struct Callbacks {
     state: Arc<State>,
 }
 
-#[pymethods]
-impl Callbacks {
-    fn on_py_start(&self, py: Python<'_>, code: Bound<'_, PyAny>, _offset: i64) {
-        record(py, &self.state, &code, EventKind::Begin);
-    }
-    fn on_py_return(
-        &self,
-        py: Python<'_>,
-        code: Bound<'_, PyAny>,
-        _offset: i64,
-        _retval: Bound<'_, PyAny>,
-    ) {
-        record(py, &self.state, &code, EventKind::End);
-    }
-    fn on_py_yield(
-        &self,
-        py: Python<'_>,
-        code: Bound<'_, PyAny>,
-        _offset: i64,
-        _retval: Bound<'_, PyAny>,
-    ) {
-        record(py, &self.state, &code, EventKind::Yield);
-    }
-    fn on_py_resume(&self, py: Python<'_>, code: Bound<'_, PyAny>, _offset: i64) {
-        record(py, &self.state, &code, EventKind::Resume);
-    }
-    fn on_py_unwind(
-        &self,
-        py: Python<'_>,
-        code: Bound<'_, PyAny>,
-        _offset: i64,
-        _exc: Bound<'_, PyAny>,
-    ) {
-        record(py, &self.state, &code, EventKind::Unwind);
-    }
-    fn on_py_throw(
-        &self,
-        py: Python<'_>,
-        code: Bound<'_, PyAny>,
-        _offset: i64,
-        _exc: Bound<'_, PyAny>,
-    ) {
-        record(py, &self.state, &code, EventKind::Throw);
-    }
+/// Shared `METH_FASTCALL` body for every event variant.
+///
+/// `slf` is the `Callbacks` pyclass instance bound at registration
+/// (passed as the `self` arg of `PyCFunction_NewEx`). We read `args[0]`
+/// (the code object) and ignore everything else — `instruction_offset`,
+/// `retval`, `exc` — without ever wrapping them. Skips per-event
+/// `Bound<PyAny>` construction and `i64` extraction that PyO3's
+/// `#[pymethod]` thunk would otherwise do.
+fn fastcall_record(
+    slf: *mut ffi::PyObject,
+    args: *mut *mut ffi::PyObject,
+    nargs: ffi::Py_ssize_t,
+    kind: EventKind,
+) -> *mut ffi::PyObject {
+    Python::attach(|py| {
+        if nargs >= 1 {
+            let cb_obj = unsafe { pyo3::Borrowed::<'_, '_, PyAny>::from_ptr(py, slf) };
+            if let Ok(b) = cb_obj.cast::<Callbacks>() {
+                let cb = b.borrow();
+                let code = unsafe { pyo3::Borrowed::<'_, '_, PyAny>::from_ptr(py, *args) };
+                record(py, &cb.state, code, kind);
+            }
+        }
+        unsafe { ffi::Py_NewRef(ffi::Py_None()) }
+    })
 }
+
+macro_rules! make_cb {
+    ($name:ident, $kind:expr) => {
+        unsafe extern "C" fn $name(
+            slf: *mut ffi::PyObject,
+            args: *mut *mut ffi::PyObject,
+            nargs: ffi::Py_ssize_t,
+        ) -> *mut ffi::PyObject {
+            fastcall_record(slf, args, nargs, $kind)
+        }
+    };
+}
+
+make_cb!(cb_py_start, EventKind::Begin);
+make_cb!(cb_py_return, EventKind::End);
+make_cb!(cb_py_yield, EventKind::Yield);
+make_cb!(cb_py_resume, EventKind::Resume);
+make_cb!(cb_py_unwind, EventKind::Unwind);
+make_cb!(cb_py_throw, EventKind::Throw);
+
+#[repr(transparent)]
+struct MethodDef(ffi::PyMethodDef);
+// Safe: PyMethodDef contains raw pointers, but for static method tables
+// the pointers are to constant data and a never-mutated function entry.
+unsafe impl Sync for MethodDef {}
+
+const fn method_def(name: &'static CStr, fp: ffi::PyCFunctionFast) -> MethodDef {
+    MethodDef(ffi::PyMethodDef {
+        ml_name: name.as_ptr(),
+        ml_meth: ffi::PyMethodDefPointer { PyCFunctionFast: fp },
+        ml_flags: ffi::METH_FASTCALL,
+        ml_doc: std::ptr::null(),
+    })
+}
+
+static MD_PY_START: MethodDef = method_def(c"_uft_py_start", cb_py_start);
+static MD_PY_RETURN: MethodDef = method_def(c"_uft_py_return", cb_py_return);
+static MD_PY_YIELD: MethodDef = method_def(c"_uft_py_yield", cb_py_yield);
+static MD_PY_RESUME: MethodDef = method_def(c"_uft_py_resume", cb_py_resume);
+static MD_PY_UNWIND: MethodDef = method_def(c"_uft_py_unwind", cb_py_unwind);
+static MD_PY_THROW: MethodDef = method_def(c"_uft_py_throw", cb_py_throw);
+
+const PAIRS: [(&str, &MethodDef); 6] = [
+    ("PY_START", &MD_PY_START),
+    ("PY_RETURN", &MD_PY_RETURN),
+    ("PY_YIELD", &MD_PY_YIELD),
+    ("PY_RESUME", &MD_PY_RESUME),
+    ("PY_UNWIND", &MD_PY_UNWIND),
+    ("PY_THROW", &MD_PY_THROW),
+];
 
 pub struct MonitoringHandle {
     pub tool_id: u8,
     pub callbacks: Py<Callbacks>,
+    pub registered: Vec<Py<PyAny>>,
 }
 
 pub fn enable(py: Python<'_>, state: Arc<State>) -> PyResult<MonitoringHandle> {
@@ -95,28 +129,35 @@ pub fn enable(py: Python<'_>, state: Arc<State>) -> PyResult<MonitoringHandle> {
     monitoring.call_method1("use_tool_id", (tool_id, "useful_tracer"))?;
 
     let events = monitoring.getattr("events")?;
-    let pairs = [
-        ("PY_START", "on_py_start"),
-        ("PY_RETURN", "on_py_return"),
-        ("PY_YIELD", "on_py_yield"),
-        ("PY_RESUME", "on_py_resume"),
-        ("PY_UNWIND", "on_py_unwind"),
-        ("PY_THROW", "on_py_throw"),
-    ];
-
-    let callbacks = Py::new(py, Callbacks { state })?;
-    let cb_bound = callbacks.bind(py);
+    let cb_obj = Py::new(py, Callbacks { state })?;
 
     let mut mask: i32 = 0;
-    for (event_name, method_name) in pairs.iter() {
+    let mut registered: Vec<Py<PyAny>> = Vec::with_capacity(PAIRS.len());
+
+    for (event_name, md) in PAIRS.iter() {
         let event_val: i32 = events.getattr(*event_name)?.extract()?;
-        let method = cb_bound.getattr(*method_name)?;
-        monitoring.call_method1("register_callback", (tool_id, event_val, method))?;
+        let cfn = unsafe {
+            ffi::PyCFunction_NewEx(
+                &md.0 as *const _ as *mut _,
+                cb_obj.as_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        if cfn.is_null() {
+            return Err(PyErr::fetch(py));
+        }
+        let cfn_bound = unsafe { Bound::from_owned_ptr(py, cfn) };
+        monitoring.call_method1("register_callback", (tool_id, event_val, &cfn_bound))?;
+        registered.push(cfn_bound.unbind());
         mask |= event_val;
     }
     monitoring.call_method1("set_events", (tool_id, mask))?;
 
-    Ok(MonitoringHandle { tool_id, callbacks })
+    Ok(MonitoringHandle {
+        tool_id,
+        callbacks: cb_obj,
+        registered,
+    })
 }
 
 pub fn disable(py: Python<'_>, handle: &MonitoringHandle) -> PyResult<()> {
@@ -124,12 +165,9 @@ pub fn disable(py: Python<'_>, handle: &MonitoringHandle) -> PyResult<()> {
     monitoring.call_method1("set_events", (handle.tool_id, 0))?;
 
     let events = monitoring.getattr("events")?;
-    let names = [
-        "PY_START", "PY_RETURN", "PY_YIELD", "PY_RESUME", "PY_UNWIND", "PY_THROW",
-    ];
     let none = py.None();
-    for n in names.iter() {
-        let ev: i32 = events.getattr(*n)?.extract()?;
+    for (event_name, _) in PAIRS.iter() {
+        let ev: i32 = events.getattr(*event_name)?.extract()?;
         monitoring.call_method1("register_callback", (handle.tool_id, ev, &none))?;
     }
     monitoring.call_method1("free_tool_id", (handle.tool_id,))?;
