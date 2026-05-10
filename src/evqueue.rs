@@ -28,13 +28,13 @@ impl EventQueue {
         }
     }
 
-    /// Lock-free push. Drops the new event if the queue is full.
-    /// Safe under no-GIL Python — concurrent producers welcome.
+    /// Lock-free push. `force_push` always succeeds; it overwrites the
+    /// oldest entry when the queue is full and returns it as `Some(_)`.
+    /// We treat that as a drop. Safe under no-GIL Python.
     #[inline]
     pub fn push(&self, ev: Event) {
-        if self.queue.push(ev).is_err() {
+        if self.queue.force_push(ev).is_some() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
-            return;
         }
         let n = self.push_count.fetch_add(1, Ordering::Relaxed) + 1;
         if n % NOTIFY_EVERY == 0 {

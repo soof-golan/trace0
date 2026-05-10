@@ -32,15 +32,13 @@ impl Interner {
     }
 
     /// Fast path: lookup by code-object pointer. Returns None on miss.
-    /// Caller must follow up with `insert` (which extracts strings via Python).
     #[inline]
     pub fn lookup(&self, key: usize) -> Option<u32> {
         self.inner.read().map.get(&key).copied()
     }
 
     /// Slow path. Materializes qualname/filename/firstlineno from the code
-    /// object while still attached to the interpreter, then takes the write
-    /// lock. Idempotent on key.
+    /// object. Runs once per code object.
     pub fn insert(&self, _py: Python<'_>, code: &Bound<'_, PyAny>, key: usize) -> u32 {
         let qualname = code
             .getattr("co_qualname")

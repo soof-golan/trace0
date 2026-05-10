@@ -1,5 +1,5 @@
 use crate::evqueue::EventQueue;
-use crate::event::{Event, EventKind, os_tid, now_us};
+use crate::event::{Event, EventKind, now_us, os_tid};
 use crate::intern::Interner;
 use crate::threads::ThreadRegistry;
 use pyo3::prelude::*;
@@ -25,15 +25,15 @@ fn record(py: Python<'_>, state: &State, code: &Bound<'_, PyAny>, kind: EventKin
     let tid = os_tid();
     state.threads.ensure(py, tid);
 
+    let q = state.queue.clone();
+    let start = state.start;
     py.detach(move || {
-        let q = state.queue.clone();
-        let ts_us = now_us(state.start);
-        let ev = Event { ts_us, tid, code_id, kind };
-        q.push(ev);
+        let ts_us = now_us(start);
+        q.push(Event { ts_us, tid, code_id, kind });
     });
 }
 
-#[pyclass]
+#[pyclass(module = "useful_tracer._core")]
 pub struct Callbacks {
     state: Arc<State>,
 }
