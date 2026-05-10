@@ -1,0 +1,22 @@
+[package]
+name = "useful_tracer"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+ahash = "0.8.12"
+crossbeam-queue = "0.3.12"
+libc = "0.2.186"
+parking_lot = "0.12.5"
+prost = "0.14.3"
+pyo3 = { version = "0.28.3", features = ["extension-module"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+
+[build-dependencies]
+prost-build = "0.14.3"
+protox = "0.9.1"
