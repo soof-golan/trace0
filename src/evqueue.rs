@@ -1,7 +1,7 @@
 use crate::event::Event;
 use parking_lot::{Condvar, Mutex};
 use rtrb::{Consumer, Producer, RingBuffer};
-use std::cell::UnsafeCell;
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -26,7 +26,7 @@ pub struct EventQueue {
 }
 
 thread_local! {
-    static PRODUCER: UnsafeCell<Option<(usize, Producer<Event>)>> = const { UnsafeCell::new(None) };
+    static PRODUCER: RefCell<Option<(usize, Producer<Event>)>> = const { RefCell::new(None) };
 }
 
 impl EventQueue {
@@ -46,8 +46,7 @@ impl EventQueue {
     #[inline]
     pub fn push(&self, ev: Event) {
         let q_id = self as *const _ as usize;
-        PRODUCER.with(|cell| {
-            let slot = unsafe { &mut *cell.get() };
+        PRODUCER.with_borrow_mut(|slot| {
             let stale = match slot {
                 Some((id, _)) => *id != q_id,
                 None => true,
