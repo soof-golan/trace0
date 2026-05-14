@@ -31,7 +31,7 @@ pub struct Tracer {
 impl Tracer {
     #[new]
     #[pyo3(signature = (output, format = None, capacity = None))]
-    fn new(output: String, format: Option<String>, capacity: Option<usize>) -> Self {
+    pub(crate) fn new(output: String, format: Option<String>, capacity: Option<usize>) -> Self {
         Self {
             output,
             format: format.unwrap_or_else(|| "json".to_string()),
@@ -40,7 +40,7 @@ impl Tracer {
         }
     }
 
-    fn start(&self, py: Python<'_>) -> PyResult<()> {
+    pub(crate) fn start(&self, py: Python<'_>) -> PyResult<()> {
         let mut slot = self.handle.lock();
         if slot.is_some() {
             return Err(PyRuntimeError::new_err("tracer already started"));
@@ -79,7 +79,7 @@ impl Tracer {
         Ok(())
     }
 
-    fn stop(&self, py: Python<'_>) -> PyResult<()> {
+    pub(crate) fn stop(&self, py: Python<'_>) -> PyResult<()> {
         let mut slot = self.handle.lock();
         let Some(mut h) = slot.take() else {
             return Err(PyRuntimeError::new_err("tracer not running"));

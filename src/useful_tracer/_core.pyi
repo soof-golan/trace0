@@ -21,3 +21,6 @@ class Tracer:
         exc_val: Optional[BaseException],
         exc_tb: Optional[TracebackType],
     ) -> bool: ...
+
+
+def cli_main(argv: list[str]) -> int: ...

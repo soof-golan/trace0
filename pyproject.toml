@@ -9,6 +9,9 @@ authors = [
 requires-python = ">=3.13"
 dependencies = []
 
+[project.scripts]
+useful-tracer = "useful_tracer.__main__:main"
+
 [tool.maturin]
 module-name = "useful_tracer._core"
 python-packages = ["useful_tracer"]
