@@ -5,18 +5,19 @@ use rtrb::{Consumer, RingBuffer};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-const PER_THREAD_CAPACITY: usize = 64 * 1024;
+pub const BATCH_N: usize = 1024;
+pub const BATCHES_CAPACITY: usize = 64;
 
-/// Per-thread SPSC sharded event queue.
+/// Per-thread batched SPSC sharded event queue.
 ///
-/// Each Python thread lazily creates its own rtrb ring on first event;
-/// the matching Consumer is registered with the shared `consumers`
-/// vector that the exporter drains. The hot push path is pure
-/// thread-local work — no shared atomics, no producer contention.
-/// The exporter polls every 20ms and wakes immediately on `close()`.
+/// Each Python thread accumulates events in a thread-local
+/// `Box<Vec<Event>>` of capacity BATCH_N. When full the box is handed
+/// off via a per-thread `rtrb` ring sized for BATCHES_CAPACITY boxes
+/// (≈ 64K events per thread of in-flight buffer). The hot push path
+/// is pure thread-local memory writes — one atomic per BATCH_N events
+/// instead of one per event.
 pub struct EventQueue {
-    consumers: Mutex<Vec<Consumer<Event>>>,
-    per_thread_capacity: usize,
+    consumers: Mutex<Vec<Consumer<Box<Vec<Event>>>>>,
     dropped: AtomicU64,
     closed: AtomicBool,
     wake_lock: Mutex<()>,
@@ -27,7 +28,6 @@ impl EventQueue {
     pub fn new(_total_capacity: usize) -> Self {
         Self {
             consumers: Mutex::new(Vec::new()),
-            per_thread_capacity: PER_THREAD_CAPACITY,
             dropped: AtomicU64::new(0),
             closed: AtomicBool::new(false),
             wake_lock: Mutex::new(()),
@@ -36,7 +36,9 @@ impl EventQueue {
     }
 
     /// Push using the caller's `PerThread` context (already borrowed).
-    /// Avoids a second TLS lookup on the hot path.
+    /// Steady state: write event into thread-local batch (no atomic).
+    /// Every BATCH_N pushes: ship the full batch through SPSC and
+    /// allocate a fresh one.
     #[inline]
     pub fn push_with_ctx(&self, ctx: &mut PerThread, ev: Event) {
         let q_id = self as *const _ as usize;
@@ -45,26 +47,36 @@ impl EventQueue {
             None => true,
         };
         if stale {
-            let (prod, cons) = RingBuffer::<Event>::new(self.per_thread_capacity);
+            let (prod, cons) = RingBuffer::<Box<Vec<Event>>>::new(BATCHES_CAPACITY);
             self.consumers.lock().push(cons);
             ctx.producer = Some((q_id, prod));
+            ctx.batch = Some(Box::new(Vec::with_capacity(BATCH_N)));
         }
-        let (_, prod) = ctx.producer.as_mut().unwrap();
-        if prod.push(ev).is_err() {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+        let batch = ctx.batch.as_mut().unwrap();
+        batch.push(ev);
+        if batch.len() >= BATCH_N {
+            let full = ctx.batch.take().unwrap();
+            let (_, prod) = ctx.producer.as_mut().unwrap();
+            if let Err(rtrb::PushError::Full(returned)) = prod.push(full) {
+                self.dropped.fetch_add(returned.len() as u64, Ordering::Relaxed);
+                let mut reused = returned;
+                reused.clear();
+                ctx.batch = Some(reused);
+            } else {
+                ctx.batch = Some(Box::new(Vec::with_capacity(BATCH_N)));
+            }
         }
     }
 
     /// Non-blocking drain. Pops up to `limit` events from all
     /// registered consumers into `out`. Returns the number drained.
-    /// Intended for the serializer thread which yield-spins.
     pub fn drain_nonblocking(&self, out: &mut Vec<Event>, limit: usize) -> usize {
         let mut consumers = self.consumers.lock();
         let mut got = 0;
         for c in consumers.iter_mut() {
-            while let Ok(ev) = c.pop() {
-                out.push(ev);
-                got += 1;
+            while let Ok(batch) = c.pop() {
+                got += batch.len();
+                out.extend_from_slice(&batch);
                 if got >= limit {
                     return got;
                 }
@@ -83,9 +95,9 @@ impl EventQueue {
             {
                 let mut consumers = self.consumers.lock();
                 'outer: for c in consumers.iter_mut() {
-                    while let Ok(ev) = c.pop() {
-                        out.push(ev);
-                        got += 1;
+                    while let Ok(batch) = c.pop() {
+                        got += batch.len();
+                        out.extend_from_slice(&batch);
                         if got >= 4096 {
                             break 'outer;
                         }
@@ -98,8 +110,8 @@ impl EventQueue {
             if self.closed.load(Ordering::Acquire) {
                 let mut consumers = self.consumers.lock();
                 for c in consumers.iter_mut() {
-                    while let Ok(ev) = c.pop() {
-                        out.push(ev);
+                    while let Ok(batch) = c.pop() {
+                        out.extend_from_slice(&batch);
                     }
                 }
                 return !out.is_empty();

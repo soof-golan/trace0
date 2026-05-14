@@ -3,6 +3,7 @@ use crate::exporter::{make_exporter, run_pipeline};
 use crate::intern::Interner;
 use crate::monitoring::{self, MonitoringHandle, State};
 use crate::threads::ThreadRegistry;
+use crate::tls::CTX;
 use parking_lot::Mutex;
 use pyo3::exceptions::{PyIOError, PyRuntimeError};
 use pyo3::prelude::*;
@@ -86,6 +87,12 @@ impl Tracer {
         };
 
         monitoring::disable(py, &h.monitoring)?;
+        // Drain the calling thread's partial batch (worker threads
+        // do this via PerThread::Drop on exit; the thread that runs
+        // `stop` is still alive). Safe to touch its TLS now —
+        // `monitoring::disable` returned so no callbacks fire here
+        // anymore.
+        CTX.with_borrow_mut(|ctx| ctx.flush_partial());
         h.queue.close();
 
         let join = h.exporter_thread.take();
