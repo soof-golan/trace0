@@ -40,7 +40,7 @@ fn record(py: Python<'_>, state: &State, code: pyo3::Borrowed<'_, '_, PyAny>, ki
         }
         state
             .queue
-            .push_with_ctx(ctx, Event { ts_ns, tid, code_id, kind });
+            .push_with_ctx(ctx, Event::new(ts_ns, tid, code_id, kind));
     });
 }
 

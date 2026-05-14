@@ -3,7 +3,7 @@ use parking_lot::RwLock;
 use pyo3::prelude::*;
 
 pub struct ThreadRegistry {
-    inner: RwLock<AHashMap<u64, String>>,
+    inner: RwLock<AHashMap<u32, String>>,
 }
 
 impl ThreadRegistry {
@@ -13,7 +13,7 @@ impl ThreadRegistry {
         }
     }
 
-    pub fn ensure(&self, py: Python<'_>, tid: u64) {
+    pub fn ensure(&self, py: Python<'_>, tid: u32) {
         if self.inner.read().contains_key(&tid) {
             return;
         }
@@ -37,11 +37,11 @@ impl ThreadRegistry {
         self.inner.write().entry(tid).or_insert(name);
     }
 
-    pub fn name(&self, tid: u64) -> Option<String> {
+    pub fn name(&self, tid: u32) -> Option<String> {
         self.inner.read().get(&tid).cloned()
     }
 
-    pub fn snapshot(&self) -> Vec<(u64, String)> {
+    pub fn snapshot(&self) -> Vec<(u32, String)> {
         self.inner
             .read()
             .iter()

@@ -73,13 +73,14 @@ impl Exporter for JsonExporter {
                 self.out.write_all(b",")?;
             }
             self.first = false;
-            let info = interner.get(ev.code_id);
+            let info = interner.get(ev.code_id());
             let (name, file, line) = match info {
                 Some(i) => (i.qualname, i.filename, i.firstlineno),
                 None => ("<unknown>".into(), String::new(), 0),
             };
             let pid = std::process::id();
-            let kind_str = match ev.kind {
+            let kind = ev.kind();
+            let kind_str = match kind {
                 EventKind::Begin => "start",
                 EventKind::End => "return",
                 EventKind::Yield => "yield",
@@ -90,7 +91,7 @@ impl Exporter for JsonExporter {
             let entry = serde_json::json!({
                 "name": name,
                 "cat": "py",
-                "ph": phase(ev.kind),
+                "ph": phase(kind),
                 "ts": ev.ts_ns / 1000,
                 "pid": pid,
                 "tid": ev.tid,
@@ -135,7 +136,7 @@ impl Exporter for JsonExporter {
 
 pub struct ProtoExporter {
     out: BufWriter<File>,
-    seen_tids: ahash::AHashSet<u64>,
+    seen_tids: ahash::AHashSet<u32>,
     process_emitted: bool,
 }
 
@@ -180,7 +181,7 @@ impl ProtoExporter {
         self.write_packet(&pkt)
     }
 
-    fn ensure_thread(&mut self, tid: u64, threads: &ThreadRegistry) -> io::Result<()> {
+    fn ensure_thread(&mut self, tid: u32, threads: &ThreadRegistry) -> io::Result<()> {
         if !self.seen_tids.insert(tid) {
             return Ok(());
         }
@@ -211,8 +212,8 @@ fn process_uuid(pid: i32) -> u64 {
     0x5000_0000_0000_0000u64 | (pid as u64)
 }
 
-fn thread_uuid(tid: u64) -> u64 {
-    0x7000_0000_0000_0000u64 | (tid & 0x0FFF_FFFF_FFFF_FFFF)
+fn thread_uuid(tid: u32) -> u64 {
+    0x7000_0000_0000_0000u64 | (tid as u64)
 }
 
 fn proto_type(kind: EventKind) -> i32 {
@@ -237,14 +238,14 @@ impl Exporter for ProtoExporter {
         for ev in events {
             self.ensure_thread(ev.tid, threads)?;
             let name = interner
-                .get(ev.code_id)
+                .get(ev.code_id())
                 .map(|i| i.qualname)
                 .unwrap_or_else(|| "<unknown>".into());
             let pkt = pb::TracePacket {
                 timestamp: Some(ev.ts_ns),
                 trusted_packet_sequence_id: Some(1),
                 data: Some(pb::trace_packet::Data::TrackEvent(pb::TrackEvent {
-                    r#type: Some(proto_type(ev.kind)),
+                    r#type: Some(proto_type(ev.kind())),
                     track_uuid: Some(thread_uuid(ev.tid)),
                     name: Some(name),
                     categories: vec!["py".into()],
