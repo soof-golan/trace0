@@ -5,9 +5,15 @@ use crate::threads::ThreadRegistry;
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
+use std::cell::Cell;
 use std::ffi::CStr;
 use std::sync::Arc;
 use std::time::Instant;
+
+thread_local! {
+    static LAST_CODE: Cell<(usize, u32)> = const { Cell::new((0, u32::MAX)) };
+    static ENSURED: Cell<bool> = const { Cell::new(false) };
+}
 
 pub struct State {
     pub queue: Arc<EventQueue>,
@@ -19,23 +25,31 @@ pub struct State {
 #[inline]
 fn record(py: Python<'_>, state: &State, code: pyo3::Borrowed<'_, '_, PyAny>, kind: EventKind) {
     let key = code.as_ptr() as usize;
-    let code_id = match state.interner.lookup(key) {
-        Some(id) => id,
-        None => state.interner.insert(py, &code, key),
-    };
+    let code_id = LAST_CODE.with(|c| {
+        let (lk, lid) = c.get();
+        if lk == key && lid != u32::MAX {
+            lid
+        } else {
+            let id = match state.interner.lookup(key) {
+                Some(id) => id,
+                None => state.interner.insert(py, &code, key),
+            };
+            c.set((key, id));
+            id
+        }
+    });
 
     let tid = os_tid();
-    state.threads.ensure(py, tid);
+    if !ENSURED.with(|c| c.get()) {
+        state.threads.ensure(py, tid);
+        ENSURED.with(|c| c.set(true));
+    }
 
-    let q = state.queue.clone();
-    let start = state.start;
-    py.detach(move || {
-        let ts_us = now_us(start);
-        q.push(Event { ts_us, tid, code_id, kind });
-    });
+    let ts_us = now_us(state.start);
+    state.queue.push(Event { ts_us, tid, code_id, kind });
 }
 
-#[pyclass(module = "useful_tracer._core")]
+#[pyclass(module = "useful_tracer._core", frozen)]
 pub struct Callbacks {
     state: Arc<State>,
 }
@@ -58,7 +72,7 @@ fn fastcall_record(
         if nargs >= 1 {
             let cb_obj = unsafe { pyo3::Borrowed::<'_, '_, PyAny>::from_ptr(py, slf) };
             if let Ok(b) = cb_obj.cast::<Callbacks>() {
-                let cb = b.borrow();
+                let cb: &Callbacks = b.get();
                 let code = unsafe { pyo3::Borrowed::<'_, '_, PyAny>::from_ptr(py, *args) };
                 record(py, &cb.state, code, kind);
             }
