@@ -5,7 +5,7 @@ use rtrb::{Consumer, RingBuffer};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-const MIN_PER_THREAD_CAPACITY: usize = 1024;
+const PER_THREAD_CAPACITY: usize = 64 * 1024;
 
 /// Per-thread SPSC sharded event queue.
 ///
@@ -24,11 +24,10 @@ pub struct EventQueue {
 }
 
 impl EventQueue {
-    pub fn new(total_capacity: usize) -> Self {
-        let per_thread = total_capacity.max(MIN_PER_THREAD_CAPACITY);
+    pub fn new(_total_capacity: usize) -> Self {
         Self {
             consumers: Mutex::new(Vec::new()),
-            per_thread_capacity: per_thread,
+            per_thread_capacity: PER_THREAD_CAPACITY,
             dropped: AtomicU64::new(0),
             closed: AtomicBool::new(false),
             wake_lock: Mutex::new(()),
@@ -54,6 +53,28 @@ impl EventQueue {
         if prod.push(ev).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Non-blocking drain. Pops up to `limit` events from all
+    /// registered consumers into `out`. Returns the number drained.
+    /// Intended for the serializer thread which yield-spins.
+    pub fn drain_nonblocking(&self, out: &mut Vec<Event>, limit: usize) -> usize {
+        let mut consumers = self.consumers.lock();
+        let mut got = 0;
+        for c in consumers.iter_mut() {
+            while let Ok(ev) = c.pop() {
+                out.push(ev);
+                got += 1;
+                if got >= limit {
+                    return got;
+                }
+            }
+        }
+        got
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
     }
 
     pub fn drain_blocking(&self, out: &mut Vec<Event>) -> bool {

@@ -5,6 +5,9 @@ use prost::Message;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread;
+use std::time::Duration;
 
 pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/perfetto.protos.rs"));
@@ -262,20 +265,103 @@ impl Exporter for ProtoExporter {
     }
 }
 
-pub fn run_exporter(
-    queue: Arc<crate::evqueue::EventQueue>,
+const FANIN_CAPACITY: usize = 1 << 22;
+const BATCH: usize = 4096;
+
+/// Two-thread pipeline. A serializer drains the per-thread SPSC rings
+/// into a single 1M SPSC fan-in buffer; a writer pops the fan-in
+/// buffer and runs the I/O-bound Exporter. Splitting separates the
+/// fast-drain step (memory-bandwidth-bound) from the slow-write step
+/// (JSON encoding / disk-bound) so the per-thread rings can stay
+/// small without dropping during bursts.
+pub fn run_pipeline(
+    inbound: Arc<crate::evqueue::EventQueue>,
     interner: Arc<Interner>,
     threads: Arc<ThreadRegistry>,
     mut exporter: Box<dyn Exporter>,
 ) -> io::Result<()> {
-    let mut buf: Vec<Event> = Vec::with_capacity(4096);
-    while queue.drain_blocking(&mut buf) {
-        exporter.write_batch(&buf, &interner, &threads)?;
-        buf.clear();
+    let (mut fanin_tx, mut fanin_rx) = rtrb::RingBuffer::<Event>::new(FANIN_CAPACITY);
+    let fanin_dropped = Arc::new(AtomicU64::new(0));
+    let fanin_closed = Arc::new(AtomicBool::new(false));
+
+    let serializer = {
+        let inbound = inbound.clone();
+        let fanin_dropped = fanin_dropped.clone();
+        let fanin_closed = fanin_closed.clone();
+        thread::Builder::new()
+            .name("useful-tracer-serializer".into())
+            .spawn(move || {
+                let mut buf: Vec<Event> = Vec::with_capacity(BATCH);
+                let mut empty_spins: u32 = 0;
+                const SPIN_BEFORE_YIELD: u32 = 1024;
+                loop {
+                    let n = inbound.drain_nonblocking(&mut buf, BATCH);
+                    if n == 0 {
+                        empty_spins += 1;
+                        if empty_spins >= SPIN_BEFORE_YIELD {
+                            if inbound.is_closed() {
+                                break;
+                            }
+                            thread::yield_now();
+                            empty_spins = 0;
+                        } else {
+                            std::hint::spin_loop();
+                        }
+                        continue;
+                    }
+                    empty_spins = 0;
+                    for ev in buf.drain(..) {
+                        if fanin_tx.push(ev).is_err() {
+                            fanin_dropped.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                // final drain after close
+                loop {
+                    let n = inbound.drain_nonblocking(&mut buf, BATCH);
+                    if n == 0 {
+                        break;
+                    }
+                    for ev in buf.drain(..) {
+                        if fanin_tx.push(ev).is_err() {
+                            fanin_dropped.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                fanin_closed.store(true, Ordering::Release);
+            })
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+    };
+
+    let mut buf: Vec<Event> = Vec::with_capacity(BATCH);
+    loop {
+        while let Ok(ev) = fanin_rx.pop() {
+            buf.push(ev);
+            if buf.len() >= BATCH {
+                break;
+            }
+        }
+        if !buf.is_empty() {
+            exporter.write_batch(&buf, &interner, &threads)?;
+            buf.clear();
+            continue;
+        }
+        if fanin_closed.load(Ordering::Acquire) {
+            while let Ok(ev) = fanin_rx.pop() {
+                buf.push(ev);
+            }
+            if !buf.is_empty() {
+                exporter.write_batch(&buf, &interner, &threads)?;
+            }
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
     }
-    if !buf.is_empty() {
-        exporter.write_batch(&buf, &interner, &threads)?;
-    }
-    exporter.finish(&interner, &threads, queue.dropped())?;
+
+    serializer
+        .join()
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "serializer panicked"))?;
+    let total_dropped = inbound.dropped() + fanin_dropped.load(Ordering::Relaxed);
+    exporter.finish(&interner, &threads, total_dropped)?;
     Ok(())
 }

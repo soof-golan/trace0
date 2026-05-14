@@ -1,5 +1,5 @@
 use crate::evqueue::EventQueue;
-use crate::exporter::{make_exporter, run_exporter};
+use crate::exporter::{make_exporter, run_pipeline};
 use crate::intern::Interner;
 use crate::monitoring::{self, MonitoringHandle, State};
 use crate::threads::ThreadRegistry;
@@ -65,7 +65,7 @@ impl Tracer {
             let threads = threads.clone();
             thread::Builder::new()
                 .name("useful-tracer-exporter".into())
-                .spawn(move || run_exporter(queue, interner, threads, exporter))
+                .spawn(move || run_pipeline(queue, interner, threads, exporter))
                 .map_err(|e| PyRuntimeError::new_err(format!("spawn exporter: {e}")))?
         };
 
