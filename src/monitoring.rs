@@ -71,11 +71,10 @@ fn fastcall_record(
     Python::attach(|py| {
         if nargs >= 1 {
             let cb_obj = unsafe { pyo3::Borrowed::<'_, '_, PyAny>::from_ptr(py, slf) };
-            if let Ok(b) = cb_obj.cast::<Callbacks>() {
-                let cb: &Callbacks = b.get();
-                let code = unsafe { pyo3::Borrowed::<'_, '_, PyAny>::from_ptr(py, *args) };
-                record(py, &cb.state, code, kind);
-            }
+            let b = unsafe { cb_obj.downcast_unchecked::<Callbacks>() };
+            let cb: &Callbacks = b.get();
+            let code = unsafe { pyo3::Borrowed::<'_, '_, PyAny>::from_ptr(py, *args) };
+            record(py, &cb.state, code, kind);
         }
         unsafe { ffi::Py_NewRef(ffi::Py_None()) }
     })

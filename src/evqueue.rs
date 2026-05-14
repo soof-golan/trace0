@@ -5,7 +5,6 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-const NOTIFY_EVERY: u64 = 256;
 const MIN_PER_THREAD_CAPACITY: usize = 1024;
 
 /// Per-thread SPSC sharded event queue.
@@ -13,13 +12,12 @@ const MIN_PER_THREAD_CAPACITY: usize = 1024;
 /// Each Python thread lazily creates its own rtrb ring on first event;
 /// the matching Consumer is registered with the shared `consumers`
 /// vector that the exporter drains. The hot push path is pure
-/// thread-local work plus a single global atomic for the wake counter
-/// — no shared queue contention between producers.
+/// thread-local work — no shared atomics, no producer contention.
+/// The exporter polls every 20ms and wakes immediately on `close()`.
 pub struct EventQueue {
     consumers: Mutex<Vec<Consumer<Event>>>,
     per_thread_capacity: usize,
     dropped: AtomicU64,
-    push_count: AtomicU64,
     closed: AtomicBool,
     wake_lock: Mutex<()>,
     wake_cv: Condvar,
@@ -36,7 +34,6 @@ impl EventQueue {
             consumers: Mutex::new(Vec::new()),
             per_thread_capacity: per_thread,
             dropped: AtomicU64::new(0),
-            push_count: AtomicU64::new(0),
             closed: AtomicBool::new(false),
             wake_lock: Mutex::new(()),
             wake_cv: Condvar::new(),
@@ -61,11 +58,6 @@ impl EventQueue {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
             }
         });
-        let n = self.push_count.fetch_add(1, Ordering::Relaxed) + 1;
-        if n % NOTIFY_EVERY == 0 {
-            let _g = self.wake_lock.lock();
-            self.wake_cv.notify_one();
-        }
     }
 
     pub fn drain_blocking(&self, out: &mut Vec<Event>) -> bool {

@@ -20,8 +20,15 @@ pub struct Event {
 }
 
 #[inline]
-pub fn now_us(start: Instant) -> u64 {
-    Instant::now().duration_since(start).as_micros() as u64
+pub fn now_us(_start: Instant) -> u64 {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::mach_absolute_time() / 1000
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Instant::now().duration_since(_start).as_micros() as u64
+    }
 }
 
 #[inline]
