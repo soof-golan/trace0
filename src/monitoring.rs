@@ -1,5 +1,5 @@
 use crate::evqueue::EventQueue;
-use crate::event::{Event, EventKind, now_ns, os_tid};
+use crate::event::{EventKind, now_ns, os_tid};
 use crate::intern::Interner;
 use crate::threads::ThreadRegistry;
 use crate::tls::CTX;
@@ -40,7 +40,7 @@ fn record(py: Python<'_>, state: &State, code: pyo3::Borrowed<'_, '_, PyAny>, ki
         }
         state
             .queue
-            .push_with_ctx(ctx, Event::new(ts_ns, tid, code_id, kind));
+            .push_with_ctx(ctx, ts_ns, tid, code_id, kind);
     });
 }
 

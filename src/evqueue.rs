@@ -1,4 +1,4 @@
-use crate::event::Event;
+use crate::event::{Event, EventKind, PackedEvent, pack_code_kind};
 use crate::tls::PerThread;
 use parking_lot::{Condvar, Mutex};
 use rtrb::{Consumer, RingBuffer};
@@ -8,16 +8,39 @@ use std::time::Duration;
 pub const BATCH_N: usize = 1024;
 pub const BATCHES_CAPACITY: usize = 64;
 
+const DELTA_OVERFLOW: u64 = u32::MAX as u64;
+
+/// A contiguous run of events from a single thread. The batch header
+/// (`base_ts`, `tid`) is written once at allocation; each per-event
+/// slot is 8 bytes (`PackedEvent { delta_ns, code_kind }`). Drain
+/// rehydrates absolute timestamps + tid into `Event` for the writer.
+pub struct EventBatch {
+    pub base_ts: u64,
+    pub tid: u32,
+    pub events: Vec<PackedEvent>,
+}
+
+impl EventBatch {
+    #[inline]
+    pub fn with_capacity(cap: usize, base_ts: u64, tid: u32) -> Self {
+        Self {
+            base_ts,
+            tid,
+            events: Vec::with_capacity(cap),
+        }
+    }
+}
+
 /// Per-thread batched SPSC sharded event queue.
 ///
 /// Each Python thread accumulates events in a thread-local
-/// `Box<Vec<Event>>` of capacity BATCH_N. When full the box is handed
-/// off via a per-thread `rtrb` ring sized for BATCHES_CAPACITY boxes
+/// `Box<EventBatch>` of cap BATCH_N. When full the box is handed off
+/// via a per-thread `rtrb` ring sized for BATCHES_CAPACITY boxes
 /// (≈ 64K events per thread of in-flight buffer). The hot push path
-/// is pure thread-local memory writes — one atomic per BATCH_N events
-/// instead of one per event.
+/// writes only 8 bytes per event and bumps a length — one atomic per
+/// BATCH_N events.
 pub struct EventQueue {
-    consumers: Mutex<Vec<Consumer<Box<Vec<Event>>>>>,
+    consumers: Mutex<Vec<Consumer<Box<EventBatch>>>>,
     dropped: AtomicU64,
     closed: AtomicBool,
     wake_lock: Mutex<()>,
@@ -36,47 +59,105 @@ impl EventQueue {
     }
 
     /// Push using the caller's `PerThread` context (already borrowed).
-    /// Steady state: write event into thread-local batch (no atomic).
-    /// Every BATCH_N pushes: ship the full batch through SPSC and
-    /// allocate a fresh one.
+    /// Computes the per-batch ts delta inline; force-closes the batch
+    /// on rare > u32::MAX-ns gaps so deltas always fit in u32.
     #[inline]
-    pub fn push_with_ctx(&self, ctx: &mut PerThread, ev: Event) {
+    pub fn push_with_ctx(
+        &self,
+        ctx: &mut PerThread,
+        ts_ns: u64,
+        tid: u32,
+        code_id: u32,
+        kind: EventKind,
+    ) {
         let q_id = self as *const _ as usize;
         let stale = match &ctx.producer {
             Some((id, _)) => *id != q_id,
             None => true,
         };
         if stale {
-            let (prod, cons) = RingBuffer::<Box<Vec<Event>>>::new(BATCHES_CAPACITY);
-            self.consumers.lock().push(cons);
-            ctx.producer = Some((q_id, prod));
-            ctx.batch = Some(Box::new(Vec::with_capacity(BATCH_N)));
+            self.init_producer(ctx, ts_ns, tid);
         }
+        let code_kind = pack_code_kind(code_id, kind);
+        // Hot path: single mut borrow of batch, push, branch on len.
         let batch = ctx.batch.as_mut().unwrap();
-        batch.push(ev);
-        if batch.len() >= BATCH_N {
-            let full = ctx.batch.take().unwrap();
-            let (_, prod) = ctx.producer.as_mut().unwrap();
-            if let Err(rtrb::PushError::Full(returned)) = prod.push(full) {
-                self.dropped.fetch_add(returned.len() as u64, Ordering::Relaxed);
-                let mut reused = returned;
-                reused.clear();
-                ctx.batch = Some(reused);
-            } else {
-                ctx.batch = Some(Box::new(Vec::with_capacity(BATCH_N)));
+        let delta = ts_ns.wrapping_sub(batch.base_ts);
+        if delta <= DELTA_OVERFLOW {
+            batch.events.push(PackedEvent {
+                delta_ns: delta as u32,
+                code_kind,
+            });
+            if batch.events.len() < BATCH_N {
+                return;
             }
+        }
+        // Cold paths: batch full or delta overflow.
+        self.slow_path(ctx, ts_ns, tid, code_kind, delta > DELTA_OVERFLOW);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn init_producer(&self, ctx: &mut PerThread, ts_ns: u64, tid: u32) {
+        let (prod, cons) = RingBuffer::<Box<EventBatch>>::new(BATCHES_CAPACITY);
+        self.consumers.lock().push(cons);
+        ctx.producer = Some((self as *const _ as usize, prod));
+        ctx.batch = Some(Box::new(EventBatch::with_capacity(BATCH_N, ts_ns, tid)));
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn slow_path(
+        &self,
+        ctx: &mut PerThread,
+        ts_ns: u64,
+        tid: u32,
+        code_kind: u32,
+        was_overflow: bool,
+    ) {
+        self.ship_and_renew(ctx, ts_ns, tid);
+        if was_overflow {
+            // After overflow the previous batch was shipped without
+            // recording this event; push it into the fresh batch.
+            ctx.batch.as_mut().unwrap().events.push(PackedEvent {
+                delta_ns: 0,
+                code_kind,
+            });
         }
     }
 
-    /// Non-blocking drain. Pops up to `limit` events from all
-    /// registered consumers into `out`. Returns the number drained.
+    #[inline]
+    fn ship_and_renew(&self, ctx: &mut PerThread, base_ts: u64, tid: u32) {
+        let full = ctx.batch.take().unwrap();
+        let (_, prod) = ctx.producer.as_mut().unwrap();
+        let dropped = full.events.len();
+        if let Err(rtrb::PushError::Full(returned)) = prod.push(full) {
+            self.dropped.fetch_add(dropped as u64, Ordering::Relaxed);
+            let mut reused = returned;
+            reused.events.clear();
+            reused.base_ts = base_ts;
+            reused.tid = tid;
+            ctx.batch = Some(reused);
+        } else {
+            ctx.batch = Some(Box::new(EventBatch::with_capacity(BATCH_N, base_ts, tid)));
+        }
+    }
+
+    /// Non-blocking drain. Reconstructs full `Event`s from packed
+    /// per-batch storage. Returns the number of events drained.
     pub fn drain_nonblocking(&self, out: &mut Vec<Event>, limit: usize) -> usize {
         let mut consumers = self.consumers.lock();
         let mut got = 0;
         for c in consumers.iter_mut() {
             while let Ok(batch) = c.pop() {
-                got += batch.len();
-                out.extend_from_slice(&batch);
+                got += batch.events.len();
+                let base = batch.base_ts;
+                let tid = batch.tid;
+                out.extend(
+                    batch
+                        .events
+                        .iter()
+                        .map(|p| Event::from_packed(base, tid, *p)),
+                );
                 if got >= limit {
                     return got;
                 }
@@ -96,8 +177,15 @@ impl EventQueue {
                 let mut consumers = self.consumers.lock();
                 'outer: for c in consumers.iter_mut() {
                     while let Ok(batch) = c.pop() {
-                        got += batch.len();
-                        out.extend_from_slice(&batch);
+                        got += batch.events.len();
+                        let base = batch.base_ts;
+                        let tid = batch.tid;
+                        out.extend(
+                            batch
+                                .events
+                                .iter()
+                                .map(|p| Event::from_packed(base, tid, *p)),
+                        );
                         if got >= 4096 {
                             break 'outer;
                         }
@@ -111,7 +199,14 @@ impl EventQueue {
                 let mut consumers = self.consumers.lock();
                 for c in consumers.iter_mut() {
                     while let Ok(batch) = c.pop() {
-                        out.extend_from_slice(&batch);
+                        let base = batch.base_ts;
+                        let tid = batch.tid;
+                        out.extend(
+                            batch
+                                .events
+                                .iter()
+                                .map(|p| Event::from_packed(base, tid, *p)),
+                        );
                     }
                 }
                 return !out.is_empty();

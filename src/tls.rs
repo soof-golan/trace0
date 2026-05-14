@@ -1,20 +1,19 @@
-use crate::event::Event;
-use crate::evqueue::BATCH_N;
+use crate::evqueue::{BATCH_N, EventBatch};
 use rtrb::Producer;
 use std::cell::RefCell;
 
 /// Combined per-thread state accessed once per event.
 ///
-/// Events are written into `batch` (a thread-local `Vec<Event>` with
-/// pre-reserved capacity). When full, the whole `Box<Vec<Event>>` is
-/// handed off via `producer` to the consumer in one SPSC push — one
-/// atomic per BATCH_N events instead of one per event.
+/// Events are packed into the thread-local `batch.events`
+/// (`Vec<PackedEvent>` with pre-reserved capacity). When full, the
+/// whole `Box<EventBatch>` is handed off via `producer` in one SPSC
+/// push — one atomic per BATCH_N events instead of one per event.
 pub struct PerThread {
     pub last_code_key: usize,
     pub last_code_id: u32,
     pub ensured: bool,
-    pub producer: Option<(usize, Producer<Box<Vec<Event>>>)>,
-    pub batch: Option<Box<Vec<Event>>>,
+    pub producer: Option<(usize, Producer<Box<EventBatch>>)>,
+    pub batch: Option<Box<EventBatch>>,
 }
 
 impl PerThread {
@@ -30,15 +29,19 @@ impl PerThread {
             self.batch = Some(batch);
             return;
         };
-        if batch.is_empty() {
+        if batch.events.is_empty() {
             self.batch = Some(batch);
             return;
         }
         // Leave a fresh writable batch in place. PEP 669 does not
         // guarantee zero callbacks after `set_events(0)` returns;
-        // a straggler PY_START on this thread would otherwise
-        // hit `unwrap` on `None` in `push_with_ctx`.
-        self.batch = Some(Box::new(Vec::with_capacity(BATCH_N)));
+        // a straggler PY_START on this thread would otherwise hit
+        // `unwrap` on `None` in `push_with_ctx`.
+        self.batch = Some(Box::new(EventBatch::with_capacity(
+            BATCH_N,
+            batch.base_ts,
+            batch.tid,
+        )));
         let _ = prod.push(batch);
     }
 }

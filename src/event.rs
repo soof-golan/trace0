@@ -26,30 +26,54 @@ impl EventKind {
     }
 }
 
-/// 16-byte event. Packed: kind in top 8 bits of `code_kind`, code id
-/// in low 24 bits. `tid` is the truncated OS thread id (low 32 bits).
+const CODE_ID_MASK: u32 = 0x00FF_FFFF;
+const CODE_ID_MAX: u32 = CODE_ID_MASK;
+
+#[inline]
+pub fn pack_code_kind(code_id: u32, kind: EventKind) -> u32 {
+    debug_assert!(code_id <= CODE_ID_MAX, "code_id exceeds 24-bit range");
+    ((kind as u32) << 24) | (code_id & CODE_ID_MASK)
+}
+
+/// 8-byte packed event living inside an `EventBatch`. `delta_ns` is
+/// ns-offset from the batch's `base_ts`; `code_kind` carries the event
+/// kind in the top 8 bits and the interned code id in the low 24.
+#[derive(Copy, Clone, Debug)]
+#[repr(C)]
+pub struct PackedEvent {
+    pub delta_ns: u32,
+    pub code_kind: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<PackedEvent>() == 8);
+
+/// 16-byte reconstructed event surfaced to the exporter. The hot path
+/// never builds one of these; `EventBatch` decode produces them at
+/// drain time.
 #[derive(Copy, Clone, Debug)]
 #[repr(C)]
 pub struct Event {
-    /// Raw timestamp at push time. `mach_absolute_time()` on macOS
-    /// (= ns on Apple Silicon), elapsed-ns since start on other
-    /// platforms. Exporters convert at write time.
     pub ts_ns: u64,
     pub tid: u32,
     code_kind: u32,
 }
 
-const CODE_ID_MASK: u32 = 0x00FF_FFFF;
-const CODE_ID_MAX: u32 = CODE_ID_MASK;
-
 impl Event {
     #[inline]
     pub fn new(ts_ns: u64, tid: u32, code_id: u32, kind: EventKind) -> Self {
-        debug_assert!(code_id <= CODE_ID_MAX, "code_id exceeds 24-bit range");
         Self {
             ts_ns,
             tid,
-            code_kind: ((kind as u32) << 24) | (code_id & CODE_ID_MASK),
+            code_kind: pack_code_kind(code_id, kind),
+        }
+    }
+
+    #[inline]
+    pub fn from_packed(base_ts: u64, tid: u32, p: PackedEvent) -> Self {
+        Self {
+            ts_ns: base_ts + p.delta_ns as u64,
+            tid,
+            code_kind: p.code_kind,
         }
     }
 
