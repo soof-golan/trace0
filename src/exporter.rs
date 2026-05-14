@@ -88,7 +88,7 @@ impl Exporter for JsonExporter {
                 "name": name,
                 "cat": "py",
                 "ph": phase(ev.kind),
-                "ts": ev.ts_us,
+                "ts": ev.ts_ns / 1000,
                 "pid": pid,
                 "tid": ev.tid,
                 "args": {
@@ -238,7 +238,7 @@ impl Exporter for ProtoExporter {
                 .map(|i| i.qualname)
                 .unwrap_or_else(|| "<unknown>".into());
             let pkt = pb::TracePacket {
-                timestamp: Some(ev.ts_us),
+                timestamp: Some(ev.ts_ns),
                 trusted_packet_sequence_id: Some(1),
                 data: Some(pb::trace_packet::Data::TrackEvent(pb::TrackEvent {
                     r#type: Some(proto_type(ev.kind)),

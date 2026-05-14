@@ -7,6 +7,7 @@ mod exporter;
 mod intern;
 mod monitoring;
 mod threads;
+mod tls;
 mod tracer;
 
 #[pymodule]

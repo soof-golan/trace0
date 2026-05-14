@@ -1,19 +1,14 @@
 use crate::evqueue::EventQueue;
-use crate::event::{Event, EventKind, now_us, os_tid};
+use crate::event::{Event, EventKind, now_ns, os_tid};
 use crate::intern::Interner;
 use crate::threads::ThreadRegistry;
+use crate::tls::CTX;
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
-use std::cell::Cell;
 use std::ffi::CStr;
 use std::sync::Arc;
 use std::time::Instant;
-
-thread_local! {
-    static LAST_CODE: Cell<(usize, u32)> = const { Cell::new((0, u32::MAX)) };
-    static ENSURED: Cell<bool> = const { Cell::new(false) };
-}
 
 pub struct State {
     pub queue: Arc<EventQueue>,
@@ -25,28 +20,28 @@ pub struct State {
 #[inline]
 fn record(py: Python<'_>, state: &State, code: pyo3::Borrowed<'_, '_, PyAny>, kind: EventKind) {
     let key = code.as_ptr() as usize;
-    let code_id = LAST_CODE.with(|c| {
-        let (lk, lid) = c.get();
-        if lk == key && lid != u32::MAX {
-            lid
+    let tid = os_tid();
+    let ts_ns = now_ns(state.start);
+    CTX.with_borrow_mut(|ctx| {
+        let code_id = if ctx.last_code_key == key && ctx.last_code_id != u32::MAX {
+            ctx.last_code_id
         } else {
             let id = match state.interner.lookup(key) {
                 Some(id) => id,
                 None => state.interner.insert(py, &code, key),
             };
-            c.set((key, id));
+            ctx.last_code_key = key;
+            ctx.last_code_id = id;
             id
+        };
+        if !ctx.ensured {
+            state.threads.ensure(py, tid);
+            ctx.ensured = true;
         }
+        state
+            .queue
+            .push_with_ctx(ctx, Event { ts_ns, tid, code_id, kind });
     });
-
-    let tid = os_tid();
-    if !ENSURED.with(|c| c.get()) {
-        state.threads.ensure(py, tid);
-        ENSURED.with(|c| c.set(true));
-    }
-
-    let ts_us = now_us(state.start);
-    state.queue.push(Event { ts_us, tid, code_id, kind });
 }
 
 #[pyclass(module = "useful_tracer._core", frozen)]

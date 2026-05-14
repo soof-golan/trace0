@@ -1,7 +1,7 @@
 use crate::event::Event;
+use crate::tls::PerThread;
 use parking_lot::{Condvar, Mutex};
-use rtrb::{Consumer, Producer, RingBuffer};
-use std::cell::RefCell;
+use rtrb::{Consumer, RingBuffer};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -23,10 +23,6 @@ pub struct EventQueue {
     wake_cv: Condvar,
 }
 
-thread_local! {
-    static PRODUCER: RefCell<Option<(usize, Producer<Event>)>> = const { RefCell::new(None) };
-}
-
 impl EventQueue {
     pub fn new(total_capacity: usize) -> Self {
         let per_thread = total_capacity.max(MIN_PER_THREAD_CAPACITY);
@@ -40,24 +36,24 @@ impl EventQueue {
         }
     }
 
+    /// Push using the caller's `PerThread` context (already borrowed).
+    /// Avoids a second TLS lookup on the hot path.
     #[inline]
-    pub fn push(&self, ev: Event) {
+    pub fn push_with_ctx(&self, ctx: &mut PerThread, ev: Event) {
         let q_id = self as *const _ as usize;
-        PRODUCER.with_borrow_mut(|slot| {
-            let stale = match slot {
-                Some((id, _)) => *id != q_id,
-                None => true,
-            };
-            if stale {
-                let (prod, cons) = RingBuffer::<Event>::new(self.per_thread_capacity);
-                self.consumers.lock().push(cons);
-                *slot = Some((q_id, prod));
-            }
-            let (_, prod) = slot.as_mut().unwrap();
-            if prod.push(ev).is_err() {
-                self.dropped.fetch_add(1, Ordering::Relaxed);
-            }
-        });
+        let stale = match &ctx.producer {
+            Some((id, _)) => *id != q_id,
+            None => true,
+        };
+        if stale {
+            let (prod, cons) = RingBuffer::<Event>::new(self.per_thread_capacity);
+            self.consumers.lock().push(cons);
+            ctx.producer = Some((q_id, prod));
+        }
+        let (_, prod) = ctx.producer.as_mut().unwrap();
+        if prod.push(ev).is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn drain_blocking(&self, out: &mut Vec<Event>) -> bool {

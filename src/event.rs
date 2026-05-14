@@ -13,21 +13,24 @@ pub enum EventKind {
 
 #[derive(Copy, Clone, Debug)]
 pub struct Event {
-    pub ts_us: u64,
+    /// Raw timestamp at push time. `mach_absolute_time()` on macOS
+    /// (= ns on Apple Silicon), elapsed-ns since start on other
+    /// platforms. Exporters convert at write time.
+    pub ts_ns: u64,
     pub tid: u64,
     pub code_id: u32,
     pub kind: EventKind,
 }
 
 #[inline]
-pub fn now_us(_start: Instant) -> u64 {
+pub fn now_ns(_start: Instant) -> u64 {
     #[cfg(target_os = "macos")]
     unsafe {
-        libc::mach_absolute_time() / 1000
+        libc::mach_absolute_time()
     }
     #[cfg(not(target_os = "macos"))]
     {
-        Instant::now().duration_since(_start).as_micros() as u64
+        Instant::now().duration_since(_start).as_nanos() as u64
     }
 }
 
