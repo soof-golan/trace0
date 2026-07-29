@@ -7,12 +7,16 @@
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
-use trace0_core::{CodeLookup, Event, Exporter, ThreadNames};
+use trace0_core::{CodeInfo, CodeLookup, Event, Exporter, ThreadNames};
 
 pub struct JsonExporter<W: Write + Send> {
     out: W,
     first: bool,
     pid: u32,
+    /// `CodeLookup::code` takes a read lock and clones three strings.
+    /// Called per event that is contention with the tracing threads, so
+    /// each code object is resolved once and kept.
+    codes: ahash::AHashMap<u32, CodeInfo>,
 }
 
 impl JsonExporter<BufWriter<File>> {
@@ -29,6 +33,7 @@ impl<W: Write + Send> JsonExporter<W> {
             out,
             first: true,
             pid: std::process::id(),
+            codes: ahash::AHashMap::new(),
         })
     }
 
@@ -56,7 +61,11 @@ impl<W: Write + Send> Exporter for JsonExporter<W> {
     ) -> io::Result<()> {
         for ev in events {
             self.separator()?;
-            let info = codes.code(ev.code_id()).unwrap_or_default();
+            let id = ev.code_id();
+            if !self.codes.contains_key(&id) {
+                self.codes.insert(id, codes.code(id).unwrap_or_default());
+            }
+            let info = &self.codes[&id];
             let kind = ev.kind();
             let entry = serde_json::json!({
                 "name": if info.qualname.is_empty() { "<unknown>" } else { &info.qualname },

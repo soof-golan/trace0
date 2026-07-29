@@ -9,7 +9,7 @@ use prost::Message;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
-use trace0_core::{CodeLookup, Event, EventKind, Exporter, ThreadNames};
+use trace0_core::{CodeLookup, Event, Exporter, ThreadNames};
 
 pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/perfetto.protos.rs"));
@@ -18,10 +18,38 @@ pub mod pb {
 /// `Trace.packet` is field 1, wire type 2 (length-delimited).
 const PACKET_TAG: u8 = (1 << 3) | 2;
 const SEQUENCE_ID: u32 = 1;
+const CATEGORY: &str = "py";
+
+/// Field tags, pre-resolved. A tag is `(field_number << 3) | wire_type`,
+/// varint-encoded, so fields past 15 need two bytes.
+mod tag {
+    /// `TracePacket.timestamp`, field 8, varint.
+    pub const TIMESTAMP: u8 = 8 << 3;
+    /// `TracePacket.track_event`, field 11, length-delimited.
+    pub const TRACK_EVENT: u8 = (11 << 3) | 2;
+    /// `TrackEvent.type`, field 9, varint.
+    pub const TYPE: u8 = 9 << 3;
+    /// `TrackEvent.track_uuid`, field 11, varint.
+    pub const TRACK_UUID: u8 = 11 << 3;
+    /// `TrackEvent.categories`, field 22, length-delimited.
+    pub const CATEGORIES: [u8; 2] = [0xb2, 0x01];
+    /// `TrackEvent.name`, field 23, length-delimited.
+    pub const NAME: [u8; 2] = [0xba, 0x01];
+}
+
+/// `TracePacket.trusted_packet_sequence_id`, field 10, varint, always 1.
+const SEQUENCE_FIELD: [u8; 2] = [10 << 3, SEQUENCE_ID as u8];
 
 pub struct ProtoExporter<W: Write + Send> {
     out: W,
     scratch: Vec<u8>,
+    /// Event packets for the current batch, written out in one call.
+    buf: Vec<u8>,
+    /// Encoded `TrackEvent` submessages, keyed by what determines them.
+    /// Only the timestamp differs between two events sharing a key, so
+    /// the rest is encoded once and copied thereafter.
+    templates: ahash::AHashMap<u64, (u32, u32)>,
+    template_bytes: Vec<u8>,
     seen_tids: ahash::AHashSet<u32>,
     process_emitted: bool,
     pid: i32,
@@ -39,6 +67,9 @@ impl<W: Write + Send> ProtoExporter<W> {
         Self {
             out,
             scratch: Vec::with_capacity(1 << 12),
+            buf: Vec::with_capacity(1 << 18),
+            templates: ahash::AHashMap::new(),
+            template_bytes: Vec::with_capacity(1 << 12),
             seen_tids: ahash::AHashSet::new(),
             process_emitted: false,
             pid: std::process::id() as i32,
@@ -63,6 +94,69 @@ impl<W: Write + Send> ProtoExporter<W> {
         let n = 1 + put_varint(&mut header[1..], self.scratch.len() as u64);
         self.out.write_all(&header[..n])?;
         self.out.write_all(&self.scratch)
+    }
+
+    /// Byte range in `template_bytes` holding the encoded `track_event`
+    /// field for this combination, building it on first sight.
+    fn template(
+        &mut self,
+        tid: u32,
+        code_id: u32,
+        opens: bool,
+        codes: &dyn CodeLookup,
+    ) -> (u32, u32) {
+        let key = ((tid as u64) << 32) | ((code_id as u64) << 1) | opens as u64;
+        if let Some(&range) = self.templates.get(&key) {
+            return range;
+        }
+
+        let name = codes
+            .code(code_id)
+            .map(|i| i.qualname)
+            .unwrap_or_else(|| "<unknown>".into());
+
+        let mut event = Vec::with_capacity(32 + name.len());
+        event.push(tag::TYPE);
+        event.push(if opens {
+            pb::track_event::Type::SliceBegin as u8
+        } else {
+            pb::track_event::Type::SliceEnd as u8
+        });
+        event.push(tag::TRACK_UUID);
+        push_varint(&mut event, thread_uuid(tid));
+        event.extend_from_slice(&tag::CATEGORIES);
+        push_varint(&mut event, CATEGORY.len() as u64);
+        event.extend_from_slice(CATEGORY.as_bytes());
+        event.extend_from_slice(&tag::NAME);
+        push_varint(&mut event, name.len() as u64);
+        event.extend_from_slice(name.as_bytes());
+
+        let start = self.template_bytes.len() as u32;
+        self.template_bytes.push(tag::TRACK_EVENT);
+        push_varint(&mut self.template_bytes, event.len() as u64);
+        self.template_bytes.extend_from_slice(&event);
+        let range = (start, self.template_bytes.len() as u32 - start);
+
+        self.templates.insert(key, range);
+        range
+    }
+
+    /// Append one event packet. prost is bypassed here: it would build a
+    /// `TracePacket` value, walk it to compute a length, then walk it
+    /// again to encode. The shape is known, so this writes the bytes.
+    fn push_event(&mut self, ts_ns: u64, template: (u32, u32)) {
+        let mut ts = [0u8; 10];
+        let ts_len = put_varint(&mut ts, ts_ns);
+        let (start, len) = template;
+
+        let body_len = 1 + ts_len + SEQUENCE_FIELD.len() + len as usize;
+        self.buf.push(PACKET_TAG);
+        push_varint(&mut self.buf, body_len as u64);
+        self.buf.push(tag::TIMESTAMP);
+        self.buf.extend_from_slice(&ts[..ts_len]);
+        self.buf.extend_from_slice(&SEQUENCE_FIELD);
+        let (a, b) = (start as usize, (start + len) as usize);
+        self.buf.extend_from_slice(&self.template_bytes[a..b]);
     }
 
     fn ensure_process(&mut self) -> io::Result<()> {
@@ -114,6 +208,14 @@ impl<W: Write + Send> ProtoExporter<W> {
     }
 }
 
+fn push_varint(out: &mut Vec<u8>, mut v: u64) {
+    while v >= 0x80 {
+        out.push((v as u8) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
 fn put_varint(buf: &mut [u8], mut v: u64) -> usize {
     let mut n = 0;
     loop {
@@ -136,14 +238,6 @@ fn thread_uuid(tid: u32) -> u64 {
     0x7000_0000_0000_0000u64 | (tid as u64)
 }
 
-fn proto_type(kind: EventKind) -> i32 {
-    if kind.opens_slice() {
-        pb::track_event::Type::SliceBegin as i32
-    } else {
-        pb::track_event::Type::SliceEnd as i32
-    }
-}
-
 impl<W: Write + Send> Exporter for ProtoExporter<W> {
     fn write_batch(
         &mut self,
@@ -152,25 +246,13 @@ impl<W: Write + Send> Exporter for ProtoExporter<W> {
         threads: &dyn ThreadNames,
     ) -> io::Result<()> {
         self.ensure_process()?;
+        self.buf.clear();
         for ev in events {
             self.ensure_thread(ev.tid, threads)?;
-            let name = codes
-                .code(ev.code_id())
-                .map(|i| i.qualname)
-                .unwrap_or_else(|| "<unknown>".into());
-            let pkt = pb::TracePacket {
-                timestamp: Some(ev.ts_ns),
-                trusted_packet_sequence_id: Some(SEQUENCE_ID),
-                data: Some(pb::trace_packet::Data::TrackEvent(pb::TrackEvent {
-                    r#type: Some(proto_type(ev.kind())),
-                    track_uuid: Some(thread_uuid(ev.tid)),
-                    name: Some(name),
-                    categories: vec!["py".into()],
-                })),
-            };
-            self.write_packet(&pkt)?;
+            let template = self.template(ev.tid, ev.code_id(), ev.kind().opens_slice(), codes);
+            self.push_event(ev.ts_ns, template);
         }
-        Ok(())
+        self.out.write_all(&self.buf)
     }
 
     fn finish(
@@ -202,7 +284,7 @@ impl<W: Write + Send> Exporter for ProtoExporter<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use trace0_core::{CodeInfo, CodeTable, ThreadTable};
+    use trace0_core::{CodeInfo, CodeTable, EventKind, ThreadTable};
 
     /// Split a raw stream back into `TracePacket`s by walking the
     /// field-1 framing this exporter writes.
