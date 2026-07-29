@@ -13,11 +13,16 @@ Roughly **13 ns per traced function call** at 4 threads on an M-series Mac.
 ## Install
 
 ```bash
-pip install trace0
+uv add trace0
 ```
 
 Requires Python 3.13+. Free-threaded builds (3.13t, 3.14t) are a first-class
 target — every thread in the interpreter is traced, not just the calling one.
+To profile under a free-threaded interpreter specifically:
+
+```bash
+uv add trace0 --python 3.13t
+```
 
 ## Use
 
@@ -33,7 +38,13 @@ with Tracer("trace.pb", "protobuf"):
 Or from the command line:
 
 ```bash
-trace0 run --output trace.pb --format protobuf your_script.py
+uv run trace0 run --output trace.pb --format protobuf your_script.py
+```
+
+Without adding it to a project, use `uvx`:
+
+```bash
+uvx trace0 run --output trace.pb --format protobuf your_script.py
 ```
 
 Formats are `json` (Chrome Trace Event, human-readable and diffable) and
