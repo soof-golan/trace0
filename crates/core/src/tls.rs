@@ -11,6 +11,9 @@ use std::cell::RefCell;
 pub struct PerThread {
     pub last_code_key: usize,
     pub last_code_id: u32,
+    /// OS thread id, resolved once. `u32::MAX` means not yet resolved.
+    /// Asking libc for it on every event costs more than the push does.
+    pub tid: u32,
     pub ensured: bool,
     pub producer: Option<(usize, Producer<Box<EventBatch>>)>,
     pub batch: Option<Box<EventBatch>>,
@@ -57,6 +60,7 @@ thread_local! {
         RefCell::new(PerThread {
             last_code_key: 0,
             last_code_id: u32::MAX,
+            tid: u32::MAX,
             ensured: false,
             producer: None,
             batch: None,

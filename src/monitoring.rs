@@ -17,9 +17,12 @@ pub struct State {
 #[inline]
 fn record(py: Python<'_>, state: &State, code: pyo3::Borrowed<'_, '_, PyAny>, kind: EventKind) {
     let key = code.as_ptr() as usize;
-    let tid = os_tid();
     let ticks = now_raw();
     CTX.with_borrow_mut(|ctx| {
+        if ctx.tid == u32::MAX {
+            ctx.tid = os_tid();
+        }
+        let tid = ctx.tid;
         let code_id = if ctx.last_code_key == key && ctx.last_code_id != u32::MAX {
             ctx.last_code_id
         } else {
@@ -65,16 +68,21 @@ fn fastcall_record(
     nargs: ffi::Py_ssize_t,
     kind: EventKind,
 ) -> *mut ffi::PyObject {
-    Python::attach(|py| {
-        if nargs >= 1 {
-            let cb_obj = unsafe { pyo3::Borrowed::<'_, '_, PyAny>::from_ptr(py, slf) };
-            let b = unsafe { cb_obj.downcast_unchecked::<Callbacks>() };
-            let cb: &Callbacks = b.get();
-            let code = unsafe { pyo3::Borrowed::<'_, '_, PyAny>::from_ptr(py, *args) };
-            record(py, &cb.state, code, kind);
-        }
-        unsafe { ffi::Py_NewRef(ffi::Py_None()) }
-    })
+    if nargs >= 1 {
+        // SAFETY: sys.monitoring dispatches callbacks from the interpreter
+        // loop, on a thread that is attached for the whole call. Nothing
+        // derived from this token escapes `record`.
+        //
+        // `Python::attach` would re-establish that state at ~35ns per
+        // event, several times what this callback's actual work costs.
+        let py = unsafe { Python::assume_attached() };
+        let cb_obj = unsafe { pyo3::Borrowed::<'_, '_, PyAny>::from_ptr(py, slf) };
+        let b = unsafe { cb_obj.downcast_unchecked::<Callbacks>() };
+        let cb: &Callbacks = b.get();
+        let code = unsafe { pyo3::Borrowed::<'_, '_, PyAny>::from_ptr(py, *args) };
+        record(py, &cb.state, code, kind);
+    }
+    unsafe { ffi::Py_NewRef(ffi::Py_None()) }
 }
 
 macro_rules! make_cb {

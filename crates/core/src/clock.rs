@@ -45,7 +45,18 @@ impl Clock {
 /// Raw monotonic counter. Ticks, not nanoseconds — see [`Clock`].
 #[inline]
 pub fn now_raw() -> u64 {
-    #[cfg(target_os = "macos")]
+    // `mach_absolute_time` reads exactly this register, but as an
+    // out-of-line libc call with a barrier, which measured at ~16ns per
+    // event -- more than everything else the callback does put together.
+    // Reading it directly gives the same tick values, and the timebase
+    // below still applies unchanged.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    unsafe {
+        let ticks: u64;
+        std::arch::asm!("mrs {}, cntvct_el0", out(reg) ticks, options(nomem, nostack, preserves_flags));
+        ticks
+    }
+    #[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
     unsafe {
         // Declared directly; libc's binding is deprecated in favour of
         // the mach2 crate, which we don't need a dependency on.
@@ -64,7 +75,18 @@ pub fn now_raw() -> u64 {
 
 /// Nanoseconds per tick, as the fraction `(numer, denom)`.
 pub fn host_timebase() -> (u32, u32) {
-    #[cfg(target_os = "macos")]
+    // Must match whatever counter `now_raw` reads. `cntvct_el0` runs at
+    // `cntfrq_el0`, which is 1GHz on Apple silicon -- nanosecond ticks,
+    // where `mach_absolute_time` only offers 24MHz (41.67ns per tick).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        let freq: u64;
+        unsafe {
+            std::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq, options(nomem, nostack, preserves_flags));
+        }
+        (1_000_000_000, freq as u32)
+    }
+    #[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
     {
         // Declared directly: libc's binding is deprecated in favour of
         // the mach2 crate, and this is the only symbol we'd want from it.
