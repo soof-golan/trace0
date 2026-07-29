@@ -132,8 +132,6 @@ pub fn os_tid() -> u32 {
 mod tests {
     use super::*;
 
-    const APPLE: (u32, u32) = (125, 3);
-
     #[test]
     fn code_id_and_kind_survive_a_round_trip() {
         for kind in [
@@ -158,15 +156,15 @@ mod tests {
     }
 
     #[test]
-    fn unpacking_applies_the_timebase() {
-        let clock = Clock::new(1_000, APPLE.0, APPLE.1);
+    fn unpacking_measures_from_the_clock_anchor() {
+        let (clock, _m) = Clock::mock_starting_at(1_000);
         let p = PackedEvent {
             delta_ticks: 24,
             code_kind: pack_code_kind(7, EventKind::Begin),
         };
         let ev = Event::from_packed(&clock, 1_000, 42, p);
-        // 24 ticks past the anchor == 1000 ns, NOT 24 ns.
-        assert_eq!(ev.ts_ns, 1_000);
+        // Base 1000 is the anchor itself, so only the delta remains.
+        assert_eq!(ev.ts_ns, 24);
         assert_eq!(ev.tid, 42);
         assert_eq!(ev.code_id(), 7);
         assert_eq!(ev.kind(), EventKind::Begin);
@@ -174,14 +172,13 @@ mod tests {
 
     #[test]
     fn batch_base_offsets_accumulate_onto_the_anchor() {
-        let clock = Clock::new(0, APPLE.0, APPLE.1);
+        let (clock, _m) = Clock::mock();
         let p = PackedEvent {
             delta_ticks: 24,
             code_kind: pack_code_kind(0, EventKind::End),
         };
         let ev = Event::from_packed(&clock, 240, 1, p);
-        // (240 + 24) ticks * 125/3 == 11000 ns.
-        assert_eq!(ev.ts_ns, 11_000);
+        assert_eq!(ev.ts_ns, 264);
     }
 
     #[test]

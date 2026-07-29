@@ -13,7 +13,7 @@ pub mod pipeline;
 pub mod sink;
 pub mod tls;
 
-pub use clock::{Clock, now_raw};
+pub use clock::Clock;
 pub use event::{Event, EventKind, PackedEvent, os_tid};
 pub use evqueue::EventQueue;
 pub use pipeline::run_pipeline;

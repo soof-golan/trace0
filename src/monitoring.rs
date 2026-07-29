@@ -6,7 +6,7 @@ use pyo3::types::PyAny;
 use std::ffi::CStr;
 use std::sync::Arc;
 use trace0_core::event::{EventKind, os_tid};
-use trace0_core::{EventQueue, clock::now_raw, tls::CTX};
+use trace0_core::{EventQueue, tls::CTX};
 
 pub struct State {
     pub queue: Arc<EventQueue>,
@@ -17,7 +17,9 @@ pub struct State {
 #[inline]
 fn record(py: Python<'_>, state: &State, code: pyo3::Borrowed<'_, '_, PyAny>, kind: EventKind) {
     let key = code.as_ptr() as usize;
-    let ticks = now_raw();
+    // Read through the queue's own clock: the counter and the scale
+    // factor that converts it must come from the same source.
+    let ticks = state.queue.clock().raw();
     CTX.with_borrow_mut(|ctx| {
         if ctx.tid == u32::MAX {
             ctx.tid = os_tid();

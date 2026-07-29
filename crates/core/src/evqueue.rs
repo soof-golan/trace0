@@ -233,10 +233,10 @@ mod tests {
     use super::*;
     use crate::tls::CTX;
 
-    const APPLE: (u32, u32) = (125, 3);
-
-    fn apple_clock() -> Clock {
-        Clock::new(0, APPLE.0, APPLE.1)
+    /// Ticks are nanoseconds on a mock clock, so a test can state the
+    /// timestamps it expects directly.
+    fn test_clock() -> Clock {
+        Clock::mock().0
     }
 
     /// Push through the real thread-local context, then drain. Runs on
@@ -259,13 +259,13 @@ mod tests {
     }
 
     #[test]
-    fn drained_timestamps_are_nanoseconds_not_ticks() {
+    fn drained_timestamps_preserve_the_gaps_between_events() {
         let out = push_and_drain(
-            apple_clock(),
+            test_clock(),
             vec![
                 (0, 7, 0, EventKind::Begin),
-                (24, 7, 0, EventKind::End),
-                (240, 7, 0, EventKind::Begin),
+                (1_000, 7, 0, EventKind::End),
+                (10_000, 7, 0, EventKind::Begin),
             ],
         );
         assert_eq!(out.len(), 3);
@@ -276,12 +276,11 @@ mod tests {
 
     #[test]
     fn a_synthetic_second_measures_as_a_second() {
-        // 24_000_000 Apple ticks is exactly one real second.
         let out = push_and_drain(
-            apple_clock(),
+            test_clock(),
             vec![
                 (0, 1, 0, EventKind::Begin),
-                (24_000_000, 1, 0, EventKind::End),
+                (1_000_000_000, 1, 0, EventKind::End),
             ],
         );
         assert_eq!(out[1].ts_ns - out[0].ts_ns, 1_000_000_000);
@@ -290,15 +289,15 @@ mod tests {
     #[test]
     fn the_clock_anchor_shifts_timestamps_to_trace_relative() {
         // A boot-relative counter that is already far along.
-        let clock = Clock::new(9_000_000_000, APPLE.0, APPLE.1);
-        let out = push_and_drain(clock, vec![(9_000_000_024, 1, 0, EventKind::Begin)]);
+        let (clock, _m) = Clock::mock_starting_at(9_000_000_000);
+        let out = push_and_drain(clock, vec![(9_000_001_000, 1, 0, EventKind::Begin)]);
         assert_eq!(out[0].ts_ns, 1_000);
     }
 
     #[test]
-    fn identity_timebase_leaves_nanosecond_input_alone() {
+    fn timestamps_are_relative_to_the_first_event_not_the_batch() {
         let out = push_and_drain(
-            Clock::new(0, 1, 1),
+            test_clock(),
             vec![(0, 1, 0, EventKind::Begin), (1_000, 1, 0, EventKind::End)],
         );
         assert_eq!(out[1].ts_ns, 1_000);
@@ -307,9 +306,9 @@ mod tests {
     #[test]
     fn events_survive_a_full_batch_boundary() {
         let pushes: Vec<_> = (0..BATCH_N + 5)
-            .map(|i| (i as u64 * 24, 3, 0, EventKind::Begin))
+            .map(|i| (i as u64 * 1_000, 3, 0, EventKind::Begin))
             .collect();
-        let out = push_and_drain(apple_clock(), pushes);
+        let out = push_and_drain(test_clock(), pushes);
         assert_eq!(out.len(), BATCH_N + 5);
         // Timestamps stay correct across the base_ticks re-anchoring.
         assert_eq!(out[BATCH_N + 4].ts_ns, (BATCH_N as u64 + 4) * 1_000);
@@ -319,18 +318,18 @@ mod tests {
     fn a_tick_gap_wider_than_u32_still_lands_at_the_right_time() {
         let big = DELTA_OVERFLOW + 1_000;
         let out = push_and_drain(
-            apple_clock(),
+            test_clock(),
             vec![(0, 1, 0, EventKind::Begin), (big, 1, 0, EventKind::End)],
         );
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].ts_ns, 0);
-        assert_eq!(out[1].ts_ns, big * 125 / 3);
+        assert_eq!(out[1].ts_ns, big);
     }
 
     #[test]
     fn code_id_and_kind_come_back_out_of_the_queue() {
         let out = push_and_drain(
-            apple_clock(),
+            test_clock(),
             vec![(0, 5, 11, EventKind::Begin), (24, 5, 22, EventKind::Yield)],
         );
         assert_eq!((out[0].code_id(), out[0].kind()), (11, EventKind::Begin));
@@ -341,7 +340,7 @@ mod tests {
     #[test]
     fn nothing_is_dropped_below_the_ring_capacity() {
         let out = push_and_drain(
-            apple_clock(),
+            test_clock(),
             (0..BATCH_N * 4)
                 .map(|i| (i as u64, 1, 0, EventKind::Begin))
                 .collect(),

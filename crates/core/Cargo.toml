@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+quanta.workspace = true
 ahash.workspace = true
 libc.workspace = true
 parking_lot.workspace = true
