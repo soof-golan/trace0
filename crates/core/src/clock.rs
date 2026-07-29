@@ -14,13 +14,26 @@ pub struct Clock {
     denom: u32,
 }
 
+const fn gcd(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
+}
+
 impl Clock {
     pub fn new(start_ticks: u64, numer: u32, denom: u32) -> Self {
         assert!(numer > 0 && denom > 0, "timebase must be non-zero");
+        // Reduced so the common timebases collapse to `denom == 1`, which
+        // `ns_since_start` converts without dividing at all. Every ratio
+        // trace0 sees in practice is n/n or 1/1.
+        let g = gcd(numer, denom);
         Self {
             start_ticks,
-            numer,
-            denom,
+            numer: numer / g,
+            denom: denom / g,
         }
     }
 
@@ -32,9 +45,20 @@ impl Clock {
 
     /// Nanoseconds elapsed between the clock's anchor and `ticks`.
     /// Saturates at zero for ticks recorded before the anchor.
+    /// Nanoseconds elapsed between the clock's anchor and `ticks`.
+    /// Saturates at zero for ticks recorded before the anchor.
+    ///
+    /// Dividing by a runtime denominator is a `__udivti3` libcall, so the
+    /// reduced `denom == 1` case -- every platform trace0 currently runs
+    /// on -- skips it. The division stays as the exact fallback for a
+    /// timebase that genuinely is a fraction.
+    #[inline]
     pub fn ns_since_start(&self, ticks: u64) -> u64 {
-        let elapsed = ticks.saturating_sub(self.start_ticks) as u128;
-        (elapsed * self.numer as u128 / self.denom as u128) as u64
+        let elapsed = ticks.saturating_sub(self.start_ticks);
+        if self.denom == 1 {
+            return elapsed.wrapping_mul(self.numer as u64);
+        }
+        ((elapsed as u128 * self.numer as u128) / self.denom as u128) as u64
     }
 
     pub fn start_ticks(&self) -> u64 {
@@ -115,6 +139,37 @@ mod tests {
 
     /// The Apple-silicon timebase: 125/3 == 41.666… ns per tick.
     const APPLE: (u32, u32) = (125, 3);
+
+    /// The multiply-only path must agree with the division it replaces,
+    /// exactly, not merely closely -- an earlier fixed-point version of
+    /// this drifted 7.7us over a tick range this test covers.
+    #[test]
+    fn reducible_timebases_convert_without_dividing() {
+        // cntvct_el0 at its 1GHz frequency, as `host_timebase` reports it.
+        let c = Clock::new(0, 1_000_000_000, 1_000_000_000);
+        assert_eq!(c.denom, 1, "n/n must reduce to 1/1");
+        for ticks in [0u64, 1, 999, 1 << 32, u64::MAX / 4, 4_000_000_000_000_000] {
+            let exact = ticks as u128 * 1_000_000_000u128 / 1_000_000_000u128;
+            assert_eq!(c.ns_since_start(ticks) as u128, exact, "at {ticks}");
+        }
+    }
+
+    #[test]
+    fn irreducible_timebases_stay_exact() {
+        let c = Clock::new(0, APPLE.0, APPLE.1);
+        assert_eq!(c.denom, 3, "125/3 has no common factor to remove");
+        for ticks in [0u64, 3, 100, 4_000_000_000_000_000] {
+            let exact = (ticks as u128 * 125 / 3) as u64;
+            assert_eq!(c.ns_since_start(ticks), exact, "at {ticks}");
+        }
+    }
+
+    #[test]
+    fn reduction_preserves_the_ratio() {
+        let reduced = Clock::new(0, 250, 6);
+        let raw = Clock::new(0, 125, 3);
+        assert_eq!((reduced.numer, reduced.denom), (raw.numer, raw.denom));
+    }
 
     #[test]
     fn anchor_reads_as_zero() {
