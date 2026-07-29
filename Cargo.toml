@@ -22,7 +22,7 @@ pyo3.workspace = true
 members = ["crates/core", "crates/json", "crates/proto"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/soof-golan/trace0"
