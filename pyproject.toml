@@ -3,6 +3,8 @@ name = "trace0"
 version = "0.1.0"
 description = "A low-overhead tracing profiler for Python, built on sys.monitoring, emitting Perfetto traces."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "Soof Golan", email = "hi@soofgolan.com" }
 ]

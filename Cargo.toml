@@ -2,6 +2,8 @@
 name = "trace0"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [lib]
 name = "_core"
@@ -22,6 +24,8 @@ members = ["crates/core", "crates/json", "crates/proto"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/soof-golan/trace0"
 
 [workspace.dependencies]
 trace0-core = { path = "crates/core" }
