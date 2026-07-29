@@ -8,11 +8,29 @@ message Trace {
 message TracePacket {
   optional uint64 timestamp = 8;
   optional uint32 trusted_packet_sequence_id = 10;
+  optional InternedData interned_data = 12;
+  // SequenceFlags: 1 = incremental state cleared, 2 = needs incremental state.
+  optional uint32 sequence_flags = 13;
 
   oneof data {
     TrackEvent track_event = 11;
     TrackDescriptor track_descriptor = 60;
   }
+}
+
+message InternedData {
+  repeated EventCategory event_categories = 1;
+  repeated EventName event_names = 2;
+}
+
+message EventCategory {
+  optional uint64 iid = 1;
+  optional string name = 2;
+}
+
+message EventName {
+  optional uint64 iid = 1;
+  optional string name = 2;
 }
 
 message TrackDescriptor {
@@ -42,6 +60,8 @@ message TrackEvent {
   }
   optional Type type = 9;
   optional uint64 track_uuid = 11;
+  repeated uint64 category_iids = 3;
+  optional uint64 name_iid = 10;
   optional string name = 23;
   repeated string categories = 22;
 }

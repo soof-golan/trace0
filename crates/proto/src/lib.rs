@@ -31,11 +31,25 @@ mod tag {
     pub const TYPE: u8 = 9 << 3;
     /// `TrackEvent.track_uuid`, field 11, varint.
     pub const TRACK_UUID: u8 = 11 << 3;
-    /// `TrackEvent.categories`, field 22, length-delimited.
-    pub const CATEGORIES: [u8; 2] = [0xb2, 0x01];
-    /// `TrackEvent.name`, field 23, length-delimited.
-    pub const NAME: [u8; 2] = [0xba, 0x01];
+    /// `TrackEvent.category_iids`, field 3, varint.
+    pub const CATEGORY_IIDS: u8 = 3 << 3;
+    /// `TrackEvent.name_iid`, field 10, varint.
+    pub const NAME_IID: u8 = 10 << 3;
+    /// `TracePacket.sequence_flags`, field 13, varint.
+    pub const SEQUENCE_FLAGS: u8 = 13 << 3;
 }
+
+/// `SequenceFlags` from Perfetto: a reader joining the stream mid-way must
+/// know these packets only make sense with the interning table that
+/// preceded them.
+const SEQ_INCREMENTAL_STATE_CLEARED: u32 = 1;
+const SEQ_NEEDS_INCREMENTAL_STATE: u32 = 2;
+
+/// Emitted on every event packet, since all of them reference interned ids.
+const NEEDS_STATE_FIELD: [u8; 2] = [tag::SEQUENCE_FLAGS, SEQ_NEEDS_INCREMENTAL_STATE as u8];
+
+/// The single category every event carries, interned once.
+const CATEGORY_IID: u64 = 1;
 
 /// `TracePacket.trusted_packet_sequence_id`, field 10, varint, always 1.
 const SEQUENCE_FIELD: [u8; 2] = [10 << 3, SEQUENCE_ID as u8];
@@ -50,6 +64,9 @@ pub struct ProtoExporter<W: Write + Send> {
     /// the rest is encoded once and copied thereafter.
     templates: ahash::AHashMap<u64, (u32, u32)>,
     template_bytes: Vec<u8>,
+    /// Interned name id per code object. Writing `Parser._parse_expression`
+    /// into all ten million of its events is most of a trace's bytes.
+    name_iids: ahash::AHashMap<u32, u64>,
     seen_tids: ahash::AHashSet<u32>,
     process_emitted: bool,
     pid: i32,
@@ -70,6 +87,7 @@ impl<W: Write + Send> ProtoExporter<W> {
             buf: Vec::with_capacity(1 << 18),
             templates: ahash::AHashMap::new(),
             template_bytes: Vec::with_capacity(1 << 12),
+            name_iids: ahash::AHashMap::new(),
             seen_tids: ahash::AHashSet::new(),
             process_emitted: false,
             pid: std::process::id() as i32,
@@ -98,24 +116,52 @@ impl<W: Write + Send> ProtoExporter<W> {
 
     /// Byte range in `template_bytes` holding the encoded `track_event`
     /// field for this combination, building it on first sight.
+    /// Interned id for this code object's name, emitting the name itself
+    /// into the stream the first time it is seen.
+    fn name_iid(&mut self, code_id: u32, codes: &dyn CodeLookup) -> io::Result<u64> {
+        if let Some(&iid) = self.name_iids.get(&code_id) {
+            return Ok(iid);
+        }
+        // 0 means "unset" in Perfetto's interning, so ids start at 1.
+        let iid = self.name_iids.len() as u64 + 1;
+        let name = codes
+            .code(code_id)
+            .map(|i| i.qualname)
+            .unwrap_or_else(|| "<unknown>".into());
+        self.write_packet(&pb::TracePacket {
+            timestamp: Some(0),
+            trusted_packet_sequence_id: Some(SEQUENCE_ID),
+            sequence_flags: Some(SEQ_NEEDS_INCREMENTAL_STATE),
+            interned_data: Some(pb::InternedData {
+                event_names: vec![pb::EventName {
+                    iid: Some(iid),
+                    name: Some(name),
+                }],
+                event_categories: vec![],
+            }),
+            data: None,
+        })?;
+        self.name_iids.insert(code_id, iid);
+        Ok(iid)
+    }
+
+    /// Byte range in `template_bytes` holding the encoded `track_event`
+    /// field for this combination, building it on first sight.
     fn template(
         &mut self,
         tid: u32,
         code_id: u32,
         opens: bool,
         codes: &dyn CodeLookup,
-    ) -> (u32, u32) {
+    ) -> io::Result<(u32, u32)> {
         let key = ((tid as u64) << 32) | ((code_id as u64) << 1) | opens as u64;
         if let Some(&range) = self.templates.get(&key) {
-            return range;
+            return Ok(range);
         }
 
-        let name = codes
-            .code(code_id)
-            .map(|i| i.qualname)
-            .unwrap_or_else(|| "<unknown>".into());
+        let name_iid = self.name_iid(code_id, codes)?;
 
-        let mut event = Vec::with_capacity(32 + name.len());
+        let mut event = Vec::with_capacity(32);
         event.push(tag::TYPE);
         event.push(if opens {
             pb::track_event::Type::SliceBegin as u8
@@ -124,12 +170,10 @@ impl<W: Write + Send> ProtoExporter<W> {
         });
         event.push(tag::TRACK_UUID);
         push_varint(&mut event, thread_uuid(tid));
-        event.extend_from_slice(&tag::CATEGORIES);
-        push_varint(&mut event, CATEGORY.len() as u64);
-        event.extend_from_slice(CATEGORY.as_bytes());
-        event.extend_from_slice(&tag::NAME);
-        push_varint(&mut event, name.len() as u64);
-        event.extend_from_slice(name.as_bytes());
+        event.push(tag::CATEGORY_IIDS);
+        push_varint(&mut event, CATEGORY_IID);
+        event.push(tag::NAME_IID);
+        push_varint(&mut event, name_iid);
 
         let start = self.template_bytes.len() as u32;
         self.template_bytes.push(tag::TRACK_EVENT);
@@ -138,7 +182,7 @@ impl<W: Write + Send> ProtoExporter<W> {
         let range = (start, self.template_bytes.len() as u32 - start);
 
         self.templates.insert(key, range);
-        range
+        Ok(range)
     }
 
     /// Append one event packet. prost is bypassed here: it would build a
@@ -149,12 +193,13 @@ impl<W: Write + Send> ProtoExporter<W> {
         let ts_len = put_varint(&mut ts, ts_ns);
         let (start, len) = template;
 
-        let body_len = 1 + ts_len + SEQUENCE_FIELD.len() + len as usize;
+        let body_len = 1 + ts_len + SEQUENCE_FIELD.len() + NEEDS_STATE_FIELD.len() + len as usize;
         self.buf.push(PACKET_TAG);
         push_varint(&mut self.buf, body_len as u64);
         self.buf.push(tag::TIMESTAMP);
         self.buf.extend_from_slice(&ts[..ts_len]);
         self.buf.extend_from_slice(&SEQUENCE_FIELD);
+        self.buf.extend_from_slice(&NEEDS_STATE_FIELD);
         let (a, b) = (start as usize, (start + len) as usize);
         self.buf.extend_from_slice(&self.template_bytes[a..b]);
     }
@@ -165,9 +210,19 @@ impl<W: Write + Send> ProtoExporter<W> {
         }
         self.process_emitted = true;
         let pid = self.pid;
+        // First packet on the sequence: declares that interning state
+        // starts here, and carries the one category every event shares.
         let pkt = pb::TracePacket {
             timestamp: Some(0),
             trusted_packet_sequence_id: Some(SEQUENCE_ID),
+            sequence_flags: Some(SEQ_INCREMENTAL_STATE_CLEARED),
+            interned_data: Some(pb::InternedData {
+                event_categories: vec![pb::EventCategory {
+                    iid: Some(CATEGORY_IID),
+                    name: Some(CATEGORY.into()),
+                }],
+                event_names: vec![],
+            }),
             data: Some(pb::trace_packet::Data::TrackDescriptor(
                 pb::TrackDescriptor {
                     uuid: Some(process_uuid(pid)),
@@ -191,6 +246,8 @@ impl<W: Write + Send> ProtoExporter<W> {
         let pkt = pb::TracePacket {
             timestamp: Some(0),
             trusted_packet_sequence_id: Some(SEQUENCE_ID),
+            interned_data: None,
+            sequence_flags: None,
             data: Some(pb::trace_packet::Data::TrackDescriptor(
                 pb::TrackDescriptor {
                     uuid: Some(thread_uuid(tid)),
@@ -249,7 +306,7 @@ impl<W: Write + Send> Exporter for ProtoExporter<W> {
         self.buf.clear();
         for ev in events {
             self.ensure_thread(ev.tid, threads)?;
-            let template = self.template(ev.tid, ev.code_id(), ev.kind().opens_slice(), codes);
+            let template = self.template(ev.tid, ev.code_id(), ev.kind().opens_slice(), codes)?;
             self.push_event(ev.ts_ns, template);
         }
         self.out.write_all(&self.buf)
@@ -268,11 +325,15 @@ impl<W: Write + Send> Exporter for ProtoExporter<W> {
             let pkt = pb::TracePacket {
                 timestamp: Some(0),
                 trusted_packet_sequence_id: Some(SEQUENCE_ID),
+                interned_data: None,
+                sequence_flags: None,
                 data: Some(pb::trace_packet::Data::TrackEvent(pb::TrackEvent {
                     r#type: Some(pb::track_event::Type::Instant as i32),
                     track_uuid: Some(process_uuid(self.pid)),
                     name: Some(format!("trace0: {dropped} events dropped")),
                     categories: vec!["py".into(), "dropped".into()],
+                    category_iids: vec![],
+                    name_iid: None,
                 })),
             };
             self.write_packet(&pkt)?;
@@ -344,6 +405,25 @@ mod tests {
             .collect()
     }
 
+    /// Resolve a track event's name through the interning table, the way
+    /// a real consumer must. Names appear once in an `interned_data`
+    /// packet; events carry only the id.
+    fn interned_names(pkts: &[pb::TracePacket]) -> std::collections::HashMap<u64, String> {
+        pkts.iter()
+            .filter_map(|p| p.interned_data.as_ref())
+            .flat_map(|d| d.event_names.iter())
+            .map(|n| (n.iid.unwrap(), n.name.clone().unwrap()))
+            .collect()
+    }
+
+    fn event_name(pkts: &[pb::TracePacket], te: &pb::TrackEvent) -> String {
+        let names = interned_names(pkts);
+        names
+            .get(&te.name_iid.unwrap())
+            .unwrap_or_else(|| panic!("name_iid {:?} was never interned", te.name_iid))
+            .clone()
+    }
+
     fn descriptors(pkts: &[pb::TracePacket]) -> Vec<&pb::TrackDescriptor> {
         pkts.iter()
             .filter_map(|p| match p.data.as_ref() {
@@ -351,6 +431,79 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn a_repeated_name_is_written_once_however_many_events_use_it() {
+        let events: Vec<_> = (0..500)
+            .map(|i| Event::new(i * 10, 7, 0, EventKind::Begin))
+            .collect();
+        let raw = export(&events, &fib_table(), &ThreadTable::new(), 0);
+        let pkts = packets(&raw);
+
+        let interned: Vec<_> = pkts
+            .iter()
+            .filter_map(|p| p.interned_data.as_ref())
+            .flat_map(|d| d.event_names.iter())
+            .collect();
+        assert_eq!(interned.len(), 1, "one code object, one interned name");
+        assert_eq!(interned[0].name.as_deref(), Some("fib"));
+
+        // The name must not appear in the byte stream once per event.
+        let occurrences = raw.windows(3).filter(|w| *w == b"fib").count();
+        assert_eq!(occurrences, 1, "name repeated in the encoded stream");
+
+        for te in track_events(&pkts) {
+            assert_eq!(te.name_iid, interned[0].iid);
+            assert!(te.name.is_none(), "name should travel as an id only");
+            assert_eq!(te.category_iids, vec![CATEGORY_IID]);
+        }
+    }
+
+    #[test]
+    fn distinct_code_objects_get_distinct_ids() {
+        let mut codes = CodeTable::new();
+        codes.push_named("alpha");
+        codes.push_named("beta");
+        let raw = export(
+            &[
+                Event::new(0, 1, 0, EventKind::Begin),
+                Event::new(1, 1, 1, EventKind::Begin),
+                Event::new(2, 1, 0, EventKind::End),
+            ],
+            &codes,
+            &ThreadTable::new(),
+            0,
+        );
+        let pkts = packets(&raw);
+        let names = interned_names(&pkts);
+        assert_eq!(names.len(), 2);
+        let resolved: Vec<_> = track_events(&pkts)
+            .iter()
+            .map(|te| names[&te.name_iid.unwrap()].clone())
+            .collect();
+        assert_eq!(resolved, vec!["alpha", "beta", "alpha"]);
+    }
+
+    #[test]
+    fn events_declare_they_depend_on_the_interning_table() {
+        let raw = export(
+            &[Event::new(0, 1, 0, EventKind::Begin)],
+            &fib_table(),
+            &ThreadTable::new(),
+            0,
+        );
+        let pkts = packets(&raw);
+        assert_eq!(
+            pkts[0].sequence_flags,
+            Some(SEQ_INCREMENTAL_STATE_CLEARED),
+            "the stream must say where interning state begins"
+        );
+        for p in pkts.iter() {
+            if matches!(p.data, Some(pb::trace_packet::Data::TrackEvent(_))) {
+                assert_eq!(p.sequence_flags, Some(SEQ_NEEDS_INCREMENTAL_STATE));
+            }
+        }
     }
 
     #[test]
@@ -362,8 +515,8 @@ mod tests {
             0,
         );
         let pkts = packets(&raw);
-        // process descriptor + thread descriptor + the event itself
-        assert_eq!(pkts.len(), 3);
+        // process descriptor + interned name + thread descriptor + the event
+        assert_eq!(pkts.len(), 4);
     }
 
     #[test]
@@ -378,7 +531,7 @@ mod tests {
         );
         let pkts = packets(&raw);
         let te = track_events(&pkts)[0];
-        assert_eq!(te.name.as_deref().unwrap().len(), 400);
+        assert_eq!(event_name(&pkts, te).len(), 400);
     }
 
     #[test]
@@ -483,6 +636,7 @@ mod tests {
             0,
         );
         let pkts = packets(&raw);
-        assert_eq!(track_events(&pkts)[0].name.as_deref(), Some("<unknown>"));
+        let te = track_events(&pkts)[0];
+        assert_eq!(event_name(&pkts, te), "<unknown>");
     }
 }
