@@ -1,13 +1,17 @@
 [project]
 name = "trace0"
 version = "0.1.0"
-description = "Add your description here"
+description = "A low-overhead tracing profiler for Python, built on sys.monitoring, emitting Perfetto traces."
 readme = "README.md"
 authors = [
     { name = "Soof Golan", email = "hi@soofgolan.com" }
 ]
 requires-python = ">=3.13"
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/soof-golan/trace0"
+Repository = "https://github.com/soof-golan/trace0"
 
 [project.scripts]
 trace0 = "trace0.__main__:main"
