@@ -139,7 +139,7 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
       # -R is required: this job never checks out, so gh has no git remote to
       # infer the repository from.
-      - name: Cut the GitHub Release
+      - name: Create the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
