@@ -39,7 +39,7 @@ impl PerThread {
         // `unwrap` on `None` in `push_with_ctx`.
         self.batch = Some(Box::new(EventBatch::with_capacity(
             BATCH_N,
-            batch.base_ts,
+            batch.base_ticks,
             batch.tid,
         )));
         let _ = prod.push(batch);

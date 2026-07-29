@@ -1,11 +1,12 @@
+use crate::format::Format;
 use crate::tracer::Tracer;
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand};
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
 #[derive(Parser)]
 #[command(
-    name = "useful-tracer",
+    name = "trace0",
     about = "Trace a Python script with sys.monitoring; emit Perfetto-compatible output."
 )]
 struct Cli {
@@ -35,21 +36,6 @@ struct RunArgs {
     /// Arguments forwarded to the script.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     script_args: Vec<String>,
-}
-
-#[derive(Copy, Clone, ValueEnum)]
-enum Format {
-    Json,
-    Protobuf,
-}
-
-impl Format {
-    fn as_str(self) -> &'static str {
-        match self {
-            Format::Json => "json",
-            Format::Protobuf => "protobuf",
-        }
-    }
 }
 
 #[pyfunction]

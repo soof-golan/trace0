@@ -23,7 +23,7 @@ import threading
 import time
 from pathlib import Path
 
-from useful_tracer import Tracer
+from trace0 import Tracer
 
 
 def normalize(x: int, scale: int) -> dict:

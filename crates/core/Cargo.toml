@@ -1,0 +1,10 @@
+[package]
+name = "trace0-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ahash.workspace = true
+libc.workspace = true
+parking_lot.workspace = true
+rtrb.workspace = true

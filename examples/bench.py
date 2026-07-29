@@ -22,7 +22,7 @@ import threading
 import time
 from pathlib import Path
 
-from useful_tracer import Tracer
+from trace0 import Tracer
 
 
 def fib(n: int) -> int:

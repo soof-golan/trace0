@@ -1,4 +1,4 @@
-"""Example workload traced with useful_tracer.
+"""Example workload traced with trace0.
 
 Generates two trace files:
   - examples/demo_trace.json  (Chrome / Perfetto JSON)
@@ -13,7 +13,7 @@ import threading
 import time
 from pathlib import Path
 
-from useful_tracer import Tracer
+from trace0 import Tracer
 
 HERE = Path(__file__).resolve().parent
 

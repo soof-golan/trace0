@@ -1,16 +1,14 @@
-use crate::evqueue::EventQueue;
-use crate::exporter::{make_exporter, run_pipeline};
+use crate::format::make_exporter;
 use crate::intern::Interner;
 use crate::monitoring::{self, MonitoringHandle, State};
 use crate::threads::ThreadRegistry;
-use crate::tls::CTX;
 use parking_lot::Mutex;
 use pyo3::exceptions::{PyIOError, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::PyType;
 use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
+use trace0_core::{Clock, CodeLookup, EventQueue, ThreadNames, run_pipeline, tls::CTX};
 
 const DEFAULT_CAPACITY: usize = 1_000_000;
 
@@ -20,10 +18,14 @@ struct RunningHandle {
     exporter_thread: Option<thread::JoinHandle<std::io::Result<()>>>,
 }
 
-#[pyclass(module = "useful_tracer._core")]
+#[pyclass(module = "trace0._core")]
 pub struct Tracer {
     output: String,
     format: String,
+    /// Accepted for API compatibility. Ring sizing is currently fixed at
+    /// BATCH_N * BATCHES_CAPACITY per thread; wiring this through is a
+    /// separate change.
+    #[allow(dead_code)]
     capacity: usize,
     handle: Mutex<Option<RunningHandle>>,
 }
@@ -47,14 +49,15 @@ impl Tracer {
             return Err(PyRuntimeError::new_err("tracer already started"));
         }
 
-        let queue = Arc::new(EventQueue::new(self.capacity));
+        // Anchor the clock before any event can be recorded, so every
+        // timestamp is a non-negative offset from the trace start.
+        let queue = Arc::new(EventQueue::new(Clock::starting_now()));
         let interner = Arc::new(Interner::new());
         let threads = Arc::new(ThreadRegistry::new());
         let state = Arc::new(State {
             queue: queue.clone(),
             interner: interner.clone(),
             threads: threads.clone(),
-            start: Instant::now(),
         });
 
         let exporter = make_exporter(&self.format, &self.output)
@@ -62,11 +65,11 @@ impl Tracer {
 
         let exporter_thread = {
             let queue = queue.clone();
-            let interner = interner.clone();
-            let threads = threads.clone();
+            let codes: Arc<dyn CodeLookup> = interner.clone();
+            let names: Arc<dyn ThreadNames> = threads.clone();
             thread::Builder::new()
-                .name("useful-tracer-exporter".into())
-                .spawn(move || run_pipeline(queue, interner, threads, exporter))
+                .name("trace0-exporter".into())
+                .spawn(move || run_pipeline(queue, codes, names, exporter))
                 .map_err(|e| PyRuntimeError::new_err(format!("spawn exporter: {e}")))?
         };
 

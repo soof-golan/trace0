@@ -1,50 +1,52 @@
-use crate::evqueue::EventQueue;
-use crate::event::{EventKind, now_ns, os_tid};
 use crate::intern::Interner;
 use crate::threads::ThreadRegistry;
-use crate::tls::CTX;
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
 use std::ffi::CStr;
 use std::sync::Arc;
-use std::time::Instant;
+use trace0_core::event::{EventKind, os_tid};
+use trace0_core::{EventQueue, clock::now_raw, tls::CTX};
 
 pub struct State {
     pub queue: Arc<EventQueue>,
     pub interner: Arc<Interner>,
     pub threads: Arc<ThreadRegistry>,
-    pub start: Instant,
 }
 
 #[inline]
 fn record(py: Python<'_>, state: &State, code: pyo3::Borrowed<'_, '_, PyAny>, kind: EventKind) {
     let key = code.as_ptr() as usize;
     let tid = os_tid();
-    let ts_ns = now_ns(state.start);
+    let ticks = now_raw();
     CTX.with_borrow_mut(|ctx| {
         let code_id = if ctx.last_code_key == key && ctx.last_code_id != u32::MAX {
             ctx.last_code_id
         } else {
-            let id = match state.interner.lookup(key) {
-                Some(id) => id,
-                None => state.interner.insert(py, &code, key),
+            let Some(id) = state
+                .interner
+                .lookup(key)
+                .or_else(|| state.interner.insert(py, &code, key))
+            else {
+                // Past the 24-bit code-id ceiling; drop rather than
+                // corrupt the kind bits of this event.
+                return;
             };
             ctx.last_code_key = key;
             ctx.last_code_id = id;
             id
         };
+        // `ensure` is best-effort: a brand-new thread reports itself as
+        // `Dummy-N` until `threading` registers it, so latching on the
+        // first attempt would leave every worker thread unnamed.
         if !ctx.ensured {
-            state.threads.ensure(py, tid);
-            ctx.ensured = true;
+            ctx.ensured = state.threads.ensure(py, tid);
         }
-        state
-            .queue
-            .push_with_ctx(ctx, ts_ns, tid, code_id, kind);
+        state.queue.push_with_ctx(ctx, ticks, tid, code_id, kind);
     });
 }
 
-#[pyclass(module = "useful_tracer._core", frozen)]
+#[pyclass(module = "trace0._core", frozen)]
 pub struct Callbacks {
     state: Arc<State>,
 }
@@ -109,12 +111,12 @@ const fn method_def(name: &'static CStr, fp: ffi::PyCFunctionFast) -> MethodDef 
     })
 }
 
-static MD_PY_START: MethodDef = method_def(c"_uft_py_start", cb_py_start);
-static MD_PY_RETURN: MethodDef = method_def(c"_uft_py_return", cb_py_return);
-static MD_PY_YIELD: MethodDef = method_def(c"_uft_py_yield", cb_py_yield);
-static MD_PY_RESUME: MethodDef = method_def(c"_uft_py_resume", cb_py_resume);
-static MD_PY_UNWIND: MethodDef = method_def(c"_uft_py_unwind", cb_py_unwind);
-static MD_PY_THROW: MethodDef = method_def(c"_uft_py_throw", cb_py_throw);
+static MD_PY_START: MethodDef = method_def(c"_t0_py_start", cb_py_start);
+static MD_PY_RETURN: MethodDef = method_def(c"_t0_py_return", cb_py_return);
+static MD_PY_YIELD: MethodDef = method_def(c"_t0_py_yield", cb_py_yield);
+static MD_PY_RESUME: MethodDef = method_def(c"_t0_py_resume", cb_py_resume);
+static MD_PY_UNWIND: MethodDef = method_def(c"_t0_py_unwind", cb_py_unwind);
+static MD_PY_THROW: MethodDef = method_def(c"_t0_py_throw", cb_py_throw);
 
 const PAIRS: [(&str, &MethodDef); 6] = [
     ("PY_START", &MD_PY_START),
@@ -127,14 +129,19 @@ const PAIRS: [(&str, &MethodDef); 6] = [
 
 pub struct MonitoringHandle {
     pub tool_id: u8,
+    // Held, not read: these keep the callback objects and the shared
+    // `Callbacks` instance alive for as long as sys.monitoring can
+    // still invoke them.
+    #[allow(dead_code)]
     pub callbacks: Py<Callbacks>,
+    #[allow(dead_code)]
     pub registered: Vec<Py<PyAny>>,
 }
 
 pub fn enable(py: Python<'_>, state: Arc<State>) -> PyResult<MonitoringHandle> {
     let monitoring = py.import("sys")?.getattr("monitoring")?;
     let tool_id: u8 = monitoring.getattr("PROFILER_ID")?.extract()?;
-    monitoring.call_method1("use_tool_id", (tool_id, "useful_tracer"))?;
+    monitoring.call_method1("use_tool_id", (tool_id, "trace0"))?;
 
     let events = monitoring.getattr("events")?;
     let cb_obj = Py::new(py, Callbacks { state })?;

@@ -1,13 +1,10 @@
 use pyo3::prelude::*;
 
 mod cli;
-mod event;
-mod evqueue;
-mod exporter;
+mod format;
 mod intern;
 mod monitoring;
 mod threads;
-mod tls;
 mod tracer;
 
 #[pymodule]

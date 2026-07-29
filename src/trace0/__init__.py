@@ -1,6 +1,6 @@
 from typing import Literal
 
-from useful_tracer._core import Tracer
+from trace0._core import Tracer
 
 TraceFormat = Literal["json", "protobuf"]
 

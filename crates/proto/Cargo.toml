@@ -1,0 +1,13 @@
+[package]
+name = "trace0-proto"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+trace0-core.workspace = true
+ahash.workspace = true
+prost.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true
+protox.workspace = true

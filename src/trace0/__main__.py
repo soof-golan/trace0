@@ -1,6 +1,6 @@
 import sys
 
-from useful_tracer._core import cli_main
+from trace0._core import cli_main
 
 
 def main() -> int:

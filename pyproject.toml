@@ -1,5 +1,5 @@
 [project]
-name = "useful-tracer"
+name = "trace0"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -10,15 +10,23 @@ requires-python = ">=3.13"
 dependencies = []
 
 [project.scripts]
-useful-tracer = "useful_tracer.__main__:main"
+trace0 = "trace0.__main__:main"
 
 [tool.maturin]
-module-name = "useful_tracer._core"
-python-packages = ["useful_tracer"]
+module-name = "trace0._core"
+python-packages = ["trace0"]
 python-source = "src"
 
 [tool.uv]
-cache-keys = [{ file = "pyproject.toml" }, { file = "src/**/*.rs" }, { file = "Cargo.toml" }, { file = "Cargo.lock" }]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "src/**/*.rs" },
+    { file = "crates/**/*.rs" },
+    { file = "crates/**/*.proto" },
+    { file = "Cargo.toml" },
+    { file = "crates/**/Cargo.toml" },
+    { file = "Cargo.lock" },
+]
 
 [build-system]
 requires = ["maturin>=1.0,<2.0"]

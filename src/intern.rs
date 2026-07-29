@@ -2,13 +2,8 @@ use ahash::AHashMap;
 use parking_lot::RwLock;
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
-
-#[derive(Clone, Debug)]
-pub struct CodeInfo {
-    pub qualname: String,
-    pub filename: String,
-    pub firstlineno: u32,
-}
+use trace0_core::event::CODE_ID_MAX;
+use trace0_core::{CodeInfo, CodeLookup};
 
 pub struct Interner {
     inner: RwLock<InternerInner>,
@@ -39,7 +34,12 @@ impl Interner {
 
     /// Slow path. Materializes qualname/filename/firstlineno from the code
     /// object. Runs once per code object.
-    pub fn insert(&self, _py: Python<'_>, code: &Bound<'_, PyAny>, key: usize) -> u32 {
+    ///
+    /// Returns `None` past `CODE_ID_MAX`: a code id shares its u32 with
+    /// the event kind, so the 2^24-th distinct code object has no
+    /// representation. Refusing it keeps the overflow from silently
+    /// rewriting the kind bits of every subsequent event.
+    pub fn insert(&self, _py: Python<'_>, code: &Bound<'_, PyAny>, key: usize) -> Option<u32> {
         let qualname = code
             .getattr("co_qualname")
             .and_then(|x| x.extract::<String>())
@@ -56,7 +56,10 @@ impl Interner {
 
         let mut g = self.inner.write();
         if let Some(&id) = g.map.get(&key) {
-            return id;
+            return Some(id);
+        }
+        if g.info.len() as u64 > CODE_ID_MAX as u64 {
+            return None;
         }
         let id = g.info.len() as u32;
         g.info.push(CodeInfo {
@@ -66,10 +69,12 @@ impl Interner {
         });
         g.refs.push(py_ref);
         g.map.insert(key, id);
-        id
+        Some(id)
     }
+}
 
-    pub fn get(&self, id: u32) -> Option<CodeInfo> {
+impl CodeLookup for Interner {
+    fn code(&self, id: u32) -> Option<CodeInfo> {
         self.inner.read().info.get(id as usize).cloned()
     }
 }
