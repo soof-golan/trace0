@@ -8,7 +8,13 @@ to a background thread over lock-free SPSC rings. It emits
 [Perfetto](https://ui.perfetto.dev)-compatible traces — open them at
 <https://ui.perfetto.dev>.
 
-Roughly **13 ns per traced function call** at 4 threads on an M-series Mac.
+On an M-series Mac, tracing costs the traced thread **~8 ns per event at 8
+threads**, rising to ~37 ns on a single thread — about 19 ns of which is
+CPython's own `sys.monitoring` dispatch rather than anything trace0 does. An
+event is one `PY_START` or `PY_RETURN`, so a function call is two.
+
+Measure it yourself with `scripts/bench_producer.py`, which reports the
+difference against the same workload untraced.
 
 ## Try it, without installing anything
 
