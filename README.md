@@ -10,23 +10,40 @@ to a background thread over lock-free SPSC rings. It emits
 
 Roughly **13 ns per traced function call** at 4 threads on an M-series Mac.
 
+## Try it, without installing anything
+
+`uvx` fetches the wheel, traces your script, and leaves nothing behind:
+
+```bash
+uvx trace0 run --output trace.pb --format protobuf your_script.py
+```
+
+Drop `trace.pb` onto <https://ui.perfetto.dev> and you have a flame chart.
+
+The traced script runs *inside* the tracer's environment, so give it whatever
+it imports with `--with`:
+
+```bash
+uvx --with httpx --with pandas trace0 run --output trace.pb your_script.py
+```
+
+To trace under a free-threaded interpreter, name it — every thread is traced,
+not just the calling one:
+
+```bash
+uvx --python 3.13t trace0 run --output trace.pb your_script.py
+```
+
 ## Install
+
+Add it to a project when you want the `Tracer` API:
 
 ```bash
 uv add trace0
 ```
 
 Requires Python 3.13+. Free-threaded builds (3.13t, 3.14t) are a first-class
-target — every thread in the interpreter is traced, not just the calling one.
-To profile under a free-threaded interpreter specifically:
-
-```bash
-uv add trace0 --python 3.13t
-```
-
-## Use
-
-As a context manager:
+target.
 
 ```python
 from trace0 import Tracer
@@ -35,16 +52,10 @@ with Tracer("trace.pb", "protobuf"):
     your_workload()
 ```
 
-Or from the command line:
+The same CLI is then on your project's path:
 
 ```bash
 uv run trace0 run --output trace.pb --format protobuf your_script.py
-```
-
-Without adding it to a project, use `uvx`:
-
-```bash
-uvx trace0 run --output trace.pb --format protobuf your_script.py
 ```
 
 Formats are `json` (Chrome Trace Event, human-readable and diffable) and
