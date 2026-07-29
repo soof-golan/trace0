@@ -299,10 +299,7 @@ mod tests {
     fn identity_timebase_leaves_nanosecond_input_alone() {
         let out = push_and_drain(
             Clock::new(0, 1, 1),
-            vec![
-                (0, 1, 0, EventKind::Begin),
-                (1_000, 1, 0, EventKind::End),
-            ],
+            vec![(0, 1, 0, EventKind::Begin), (1_000, 1, 0, EventKind::End)],
         );
         assert_eq!(out[1].ts_ns, 1_000);
     }
@@ -334,10 +331,7 @@ mod tests {
     fn code_id_and_kind_come_back_out_of_the_queue() {
         let out = push_and_drain(
             apple_clock(),
-            vec![
-                (0, 5, 11, EventKind::Begin),
-                (24, 5, 22, EventKind::Yield),
-            ],
+            vec![(0, 5, 11, EventKind::Begin), (24, 5, 22, EventKind::Yield)],
         );
         assert_eq!((out[0].code_id(), out[0].kind()), (11, EventKind::Begin));
         assert_eq!((out[1].code_id(), out[1].kind()), (22, EventKind::Yield));

@@ -105,7 +105,9 @@ unsafe impl Sync for MethodDef {}
 const fn method_def(name: &'static CStr, fp: ffi::PyCFunctionFast) -> MethodDef {
     MethodDef(ffi::PyMethodDef {
         ml_name: name.as_ptr(),
-        ml_meth: ffi::PyMethodDefPointer { PyCFunctionFast: fp },
+        ml_meth: ffi::PyMethodDefPointer {
+            PyCFunctionFast: fp,
+        },
         ml_flags: ffi::METH_FASTCALL,
         ml_doc: std::ptr::null(),
     })

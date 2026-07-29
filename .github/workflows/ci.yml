@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The `trace0` cdylib cannot be linked outside of maturin (it deliberately
+  # leaves the CPython symbols undefined), so the Rust suite runs on the three
+  # pyo3-free library crates.
+  rust:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy -p trace0-core -p trace0-json -p trace0-proto -- -D warnings
+      - run: cargo test -p trace0-core -p trace0-json -p trace0-proto
+
+  # Proves the extension still builds and traces on the interpreters the
+  # release matrix targets, before a tag makes it permanent.
+  python:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-latest]
+        python: ["3.13", "3.13t", "3.14", "3.14t"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v7
+      - name: Trace a real workload
+        run: uv run --python ${{ matrix.python }} scripts/smoke.py

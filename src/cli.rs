@@ -54,11 +54,7 @@ pub fn cli_main(py: Python<'_>, argv: Vec<String>) -> PyResult<i32> {
 }
 
 fn run(py: Python<'_>, a: RunArgs) -> PyResult<i32> {
-    let tracer = Tracer::new(
-        a.output,
-        Some(a.format.as_str().to_string()),
-        a.capacity,
-    );
+    let tracer = Tracer::new(a.output, Some(a.format.as_str().to_string()), a.capacity);
 
     let sys = py.import("sys")?;
     let saved_argv: Py<PyAny> = sys.getattr("argv")?.unbind();

@@ -225,7 +225,12 @@ mod tests {
             .unwrap()
             .iter()
             .filter(|e| e["ph"] == "M")
-            .map(|e| (e["tid"].as_u64().unwrap(), e["args"]["name"].as_str().unwrap().to_string()))
+            .map(|e| {
+                (
+                    e["tid"].as_u64().unwrap(),
+                    e["args"]["name"].as_str().unwrap().to_string(),
+                )
+            })
             .collect();
         assert_eq!(
             meta,

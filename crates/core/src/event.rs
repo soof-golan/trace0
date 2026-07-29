@@ -41,7 +41,10 @@ impl EventKind {
     /// `Throw` opens: it fires when a generator is resumed via
     /// `.throw()`, which re-enters the frame just as `Resume` does.
     pub fn opens_slice(self) -> bool {
-        matches!(self, EventKind::Begin | EventKind::Resume | EventKind::Throw)
+        matches!(
+            self,
+            EventKind::Begin | EventKind::Resume | EventKind::Throw
+        )
     }
 }
 

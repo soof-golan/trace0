@@ -105,8 +105,7 @@ impl ThreadNames for ThreadTable {
     }
 
     fn snapshot(&self) -> Vec<(u32, String)> {
-        let mut out: Vec<(u32, String)> =
-            self.names.iter().map(|(k, v)| (*k, v.clone())).collect();
+        let mut out: Vec<(u32, String)> = self.names.iter().map(|(k, v)| (*k, v.clone())).collect();
         out.sort_by_key(|(tid, _)| *tid);
         out
     }

@@ -74,15 +74,17 @@ impl<W: Write + Send> ProtoExporter<W> {
         let pkt = pb::TracePacket {
             timestamp: Some(0),
             trusted_packet_sequence_id: Some(SEQUENCE_ID),
-            data: Some(pb::trace_packet::Data::TrackDescriptor(pb::TrackDescriptor {
-                uuid: Some(process_uuid(pid)),
-                name: Some(format!("python:{pid}")),
-                process: Some(pb::ProcessDescriptor {
-                    pid: Some(pid),
-                    process_name: Some("python".into()),
-                }),
-                ..Default::default()
-            })),
+            data: Some(pb::trace_packet::Data::TrackDescriptor(
+                pb::TrackDescriptor {
+                    uuid: Some(process_uuid(pid)),
+                    name: Some(format!("python:{pid}")),
+                    process: Some(pb::ProcessDescriptor {
+                        pid: Some(pid),
+                        process_name: Some("python".into()),
+                    }),
+                    ..Default::default()
+                },
+            )),
         };
         self.write_packet(&pkt)
     }
@@ -95,16 +97,18 @@ impl<W: Write + Send> ProtoExporter<W> {
         let pkt = pb::TracePacket {
             timestamp: Some(0),
             trusted_packet_sequence_id: Some(SEQUENCE_ID),
-            data: Some(pb::trace_packet::Data::TrackDescriptor(pb::TrackDescriptor {
-                uuid: Some(thread_uuid(tid)),
-                parent_uuid: Some(process_uuid(pid)),
-                thread: Some(pb::ThreadDescriptor {
-                    pid: Some(pid),
-                    tid: Some(tid as i32),
-                    thread_name: threads.name(tid),
-                }),
-                ..Default::default()
-            })),
+            data: Some(pb::trace_packet::Data::TrackDescriptor(
+                pb::TrackDescriptor {
+                    uuid: Some(thread_uuid(tid)),
+                    parent_uuid: Some(process_uuid(pid)),
+                    thread: Some(pb::ThreadDescriptor {
+                        pid: Some(pid),
+                        tid: Some(tid as i32),
+                        thread_name: threads.name(tid),
+                    }),
+                    ..Default::default()
+                },
+            )),
         };
         self.write_packet(&pkt)
     }
