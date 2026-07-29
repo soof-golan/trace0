@@ -24,15 +24,22 @@ def worker() -> None:
     slow_call()
 
 
-def trace_to(path: Path) -> dict:
+def trace_to(path: Path) -> tuple[dict, float]:
+    """Trace the workload, and time it independently of the tracer."""
     workers = [threading.Thread(target=worker, name=f"w{i}") for i in range(3)]
-    with Tracer(str(path), format="json"):
-        for t in workers:
-            t.start()
-        slow_call()
-        for t in workers:
-            t.join()
-    return json.loads(path.read_text())
+    tracer = Tracer(str(path), format="json")
+    tracer.start()
+    # Timed from inside the tracer: clock calibration and the final drain
+    # are real costs, but they are not part of any slice.
+    started = time.perf_counter()
+    for t in workers:
+        t.start()
+    slow_call()
+    for t in workers:
+        t.join()
+    wall = time.perf_counter() - started
+    tracer.stop()
+    return json.loads(path.read_text()), wall
 
 
 def check_slices_are_balanced(events: list[dict]) -> None:
@@ -46,8 +53,15 @@ def check_slices_are_balanced(events: list[dict]) -> None:
     assert all(d == 0 for d in depth.values()), f"unclosed slices: {depth}"
 
 
-def check_durations_are_wall_clock(events: list[dict]) -> None:
-    """A 50ms sleep must read as ~50ms, not 1.2ms and not 2s."""
+def check_durations_are_wall_clock(events: list[dict], wall: float) -> None:
+    """Slice durations must agree with time actually spent.
+
+    Compared against the measured duration of the traced region, not
+    against the nominal sleep: a loaded machine overshoots `time.sleep`
+    badly, and that inflates both numbers together. A wrong timebase moves
+    only one of them, which is what this is here to catch -- the bug that
+    shipped scaled every duration by 41.67x.
+    """
     opened: dict[tuple[int, str], float] = {}
     longest = 0.0
     for e in events:
@@ -57,8 +71,11 @@ def check_durations_are_wall_clock(events: list[dict]) -> None:
         elif e["ph"] == "E" and key in opened:
             longest = max(longest, e["ts"] - opened.pop(key))
     seconds = longest / 1_000_000
-    assert SLEEP * 0.8 < seconds < SLEEP * 4, (
-        f"longest slice was {seconds:.6f}s, expected ~{SLEEP}s — timebase is wrong"
+    # The sleep dominates the region, so the longest slice should be a good
+    # fraction of it, and cannot meaningfully exceed it.
+    assert wall / 10 < seconds < wall * 1.5, (
+        f"longest slice was {seconds:.6f}s inside a {wall:.6f}s traced "
+        f"region — timebase is wrong"
     )
 
 
@@ -70,17 +87,20 @@ def check_worker_threads_are_named(events: list[dict]) -> None:
 
 def main() -> None:
     with tempfile.TemporaryDirectory() as d:
-        trace = trace_to(Path(d) / "smoke.json")
+        trace, wall = trace_to(Path(d) / "smoke.json")
 
     events = trace["traceEvents"]
     assert events, "traced a real workload but got no events"
     assert trace["droppedEvents"] == 0, f"dropped {trace['droppedEvents']} events"
 
     check_slices_are_balanced(events)
-    check_durations_are_wall_clock(events)
+    check_durations_are_wall_clock(events, wall)
     check_worker_threads_are_named(events)
 
-    print(f"ok: {len(events)} events, {trace['droppedEvents']} dropped")
+    print(
+        f"ok: {len(events)} events, {trace['droppedEvents']} dropped, "
+        f"{wall * 1000:.1f}ms traced"
+    )
 
 
 if __name__ == "__main__":
