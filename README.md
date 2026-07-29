@@ -17,12 +17,12 @@ measured with `hyperfine`:
 | | wall time | vs vanilla | overhead per event |
 | --- | --- | --- | --- |
 | vanilla | 0.99 s | — | — |
-| **trace0** (protobuf) | **1.40 s** | **1.42×** | **39 ns** |
+| **trace0** (protobuf) | **1.39 s** | **1.43×** | **39 ns** |
 | `cProfile` | 2.40 s | 2.43× | 131 ns |
 | `profile` | 19.27 s | 19.5× | 1.9 µs |
 
 trace0 costs about a third of what `cProfile` does *and* keeps every event,
-where `cProfile` only keeps per-function aggregates. The trace was 529MB —
+where `cProfile` only keeps per-function aggregates. The trace was 317MB —
 a full timeline is not free, it is just cheaper in time than in disk.
 
 Reproduce with `scripts/workload_sqlglot.py`. Microbenchmark the callback
