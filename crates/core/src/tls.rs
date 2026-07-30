@@ -17,6 +17,7 @@ pub struct Hot {
     pub last_code_id: u32,
     pub tid: u32,
     pub ensured: bool,
+    pub name_retries: u32,
 }
 
 const _: () = assert!(!std::mem::needs_drop::<Hot>());
@@ -32,6 +33,7 @@ impl Hot {
         last_code_id: u32::MAX,
         tid: u32::MAX,
         ensured: false,
+        name_retries: 0,
     };
 }
 

@@ -36,6 +36,8 @@ impl ThreadNames for State {
     }
 }
 
+const NAME_RETRIES: u32 = 64;
+
 #[cold]
 #[inline(never)]
 fn resolve_cold(
@@ -49,11 +51,13 @@ fn resolve_cold(
         *codes() = CodeCache::EMPTY;
         hot.last_code_key = trace0_core::tls::NOT_CACHED;
         hot.ensured = false;
+        hot.name_retries = NAME_RETRIES;
     }
     if hot.tid == u32::MAX {
         hot.tid = os_tid();
     }
-    if !hot.ensured {
+    if !hot.ensured && hot.name_retries > 0 {
+        hot.name_retries -= 1;
         hot.ensured = state.threads.ensure(py, hot.tid);
     }
     let id = match codes().get(key) {
@@ -68,7 +72,7 @@ fn resolve_cold(
         }
     };
     hot.last_code_id = id;
-    hot.last_code_key = if hot.ensured {
+    hot.last_code_key = if hot.ensured || hot.name_retries == 0 {
         key
     } else {
         trace0_core::tls::NOT_CACHED
