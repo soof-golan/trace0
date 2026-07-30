@@ -26,7 +26,7 @@ struct RunArgs {
     #[arg(short, long)]
     output: String,
     /// Output format.
-    #[arg(short, long, value_enum, default_value_t = Format::Json)]
+    #[arg(short, long, value_enum, default_value_t = Format::Protobuf)]
     format: Format,
     /// Python script to run.
     script: String,

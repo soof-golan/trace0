@@ -22,10 +22,28 @@ def trace0(*args: str) -> subprocess.CompletedProcess:
 
 @pytest.mark.parametrize(
     "text",
-    ["Output file path", "Output format", "Python script to run", "Arguments forwarded"],
+    [
+        "Output file path",
+        "Output format",
+        "Python script to run",
+        "Arguments forwarded",
+        "[default: protobuf]",
+    ],
 )
 def test_run_help_documents_every_argument(text: str):
     assert text in trace0("run", "--help").stdout
+
+
+def test_the_default_format_is_protobuf(tmp_path: Path):
+    """A run with no `--format` writes a length-delimited stream of
+    `Trace.packet` entries, whose first byte is field 1, wire type 2."""
+    script = tmp_path / "workload.py"
+    script.write_text("def f():\n    return 1\n\nf()\n")
+    out = tmp_path / "out.pb"
+
+    result = trace0("run", "--output", str(out), str(script))
+    assert result.returncode == 0, result.stderr
+    assert out.read_bytes()[0] == 0x0A
 
 
 def test_run_traces_a_script_to_the_requested_path(tmp_path: Path):

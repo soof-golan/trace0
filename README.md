@@ -50,7 +50,7 @@ threads**, ~14 ns on a single thread. An event is one `PY_START` or
 `uvx` fetches the wheel, traces your script, and leaves nothing behind:
 
 ```bash
-uvx trace0 run --output trace.pb --format protobuf your_script.py
+uvx trace0 run --output trace.pb your_script.py
 ```
 
 Drop `trace.pb` onto <https://ui.perfetto.dev> and you have a flame chart.
@@ -90,11 +90,12 @@ with Tracer("trace.pb", "protobuf"):
 The same CLI is then on your project's path:
 
 ```bash
-uv run trace0 run --output trace.pb --format protobuf your_script.py
+uv run trace0 run --output trace.pb your_script.py
 ```
 
-Formats are `json` (Chrome Trace Event, human-readable and diffable) and
-`protobuf` (Perfetto, smaller and faster to write).
+Formats are `protobuf` (Perfetto, smaller and faster to write, the default)
+and `json` (Chrome Trace Event, human-readable and diffable) — pass
+`--format json` for the latter.
 
 ## Status
 
