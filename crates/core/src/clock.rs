@@ -5,35 +5,58 @@
 //! `clock_gettime` where neither is usable. Those ticks are not
 //! nanoseconds, and the conversion happens here, at drain time.
 //!
-//! Counter and conversion both come from [`quanta`], deliberately. Every
-//! timebase bug this crate has had came from pairing a counter with a
-//! scale factor derived somewhere else; asking one component for both
-//! makes that mismatch unrepresentable. quanta also calibrates against a
-//! reference clock rather than trusting a declared frequency, and scales
-//! with a multiply and a shift rather than a division.
+//! Whatever counter is read, its scale must come from the same place.
+//! Every timebase bug this crate has had was a counter paired with a scale
+//! factor derived somewhere else.
+//!
+//! On aarch64 that pairing is architectural: `CNTFRQ_EL0` states the rate
+//! of `CNTVCT_EL0` by definition, so the frequency is known exactly and
+//! there is nothing to measure. Everywhere else -- notably x86_64, where
+//! the TSC rate is often not discoverable at all -- [`quanta`] measures
+//! the counter against a reference clock, which costs up to 200ms once per
+//! process.
 
 use std::sync::Arc;
 
 pub use quanta::Mock;
 
+/// Where ticks come from, and what they are worth in nanoseconds.
+#[derive(Clone, Debug)]
+enum Source {
+    /// A counter that describes its own rate. Nothing to calibrate.
+    SelfDescribing { nanos_num: u64, nanos_den: u64 },
+    /// A counter of unknown rate, measured against a reference clock.
+    Measured(quanta::Clock),
+}
+
 /// Monotonic clock anchored at a fixed start, converting raw counter
 /// ticks to nanoseconds since that anchor.
 #[derive(Clone, Debug)]
 pub struct Clock {
-    inner: quanta::Clock,
+    source: Source,
     start_ticks: u64,
 }
 
 impl Clock {
     /// Clock anchored at the current instant.
     ///
-    /// The first call in the process calibrates the counter against a
-    /// reference clock, which quanta bounds at 200ms. Calibration is
-    /// global, so later clocks reuse it.
+    /// Free where the counter states its own frequency. Otherwise the
+    /// first call in the process spends up to 200ms calibrating, once,
+    /// globally.
     pub fn starting_now() -> Self {
-        let inner = quanta::Clock::new();
-        let start_ticks = inner.raw();
-        Self { inner, start_ticks }
+        let source = match self_describing_timebase() {
+            Some((nanos_num, nanos_den)) => Source::SelfDescribing {
+                nanos_num,
+                nanos_den,
+            },
+            None => Source::Measured(quanta::Clock::new()),
+        };
+        let mut clock = Self {
+            source,
+            start_ticks: 0,
+        };
+        clock.start_ticks = clock.raw();
+        clock
     }
 
     /// Synthetic clock whose ticks are nanoseconds and only advance when
@@ -55,24 +78,82 @@ impl Clock {
 
     fn mock_from(inner: quanta::Clock, mock: Arc<Mock>) -> (Self, Arc<Mock>) {
         let start_ticks = inner.raw();
-        (Self { inner, start_ticks }, mock)
+        let source = Source::Measured(inner);
+        (
+            Self {
+                source,
+                start_ticks,
+            },
+            mock,
+        )
     }
 
     /// Raw counter reading. Ticks, not nanoseconds.
     #[inline]
     pub fn raw(&self) -> u64 {
-        self.inner.raw()
+        match &self.source {
+            Source::SelfDescribing { .. } => read_counter(),
+            Source::Measured(clock) => clock.raw(),
+        }
     }
 
     /// Nanoseconds elapsed between the clock's anchor and `ticks`.
     /// Saturates at zero for ticks recorded before the anchor.
     #[inline]
     pub fn ns_since_start(&self, ticks: u64) -> u64 {
-        self.inner.delta_as_nanos(self.start_ticks, ticks)
+        match &self.source {
+            Source::SelfDescribing {
+                nanos_num,
+                nanos_den,
+            } => {
+                let delta = ticks.saturating_sub(self.start_ticks) as u128;
+                (delta * *nanos_num as u128 / *nanos_den as u128) as u64
+            }
+            Source::Measured(clock) => clock.delta_as_nanos(self.start_ticks, ticks),
+        }
     }
 
     pub fn start_ticks(&self) -> u64 {
         self.start_ticks
+    }
+}
+
+/// `(nanoseconds_numerator, denominator)` for a counter that states its
+/// own rate, or `None` when the rate has to be measured.
+fn self_describing_timebase() -> Option<(u64, u64)> {
+    #[cfg(all(target_arch = "aarch64", not(target_os = "ios")))]
+    {
+        // CNTFRQ_EL0 is defined as the rate of CNTVCT_EL0, so these two
+        // reads cannot disagree with each other.
+        let freq: u64;
+        unsafe {
+            std::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq, options(nomem, nostack, preserves_flags));
+        }
+        // A zero here means firmware never programmed the register.
+        if freq == 0 {
+            return None;
+        }
+        Some((1_000_000_000, freq))
+    }
+    #[cfg(not(all(target_arch = "aarch64", not(target_os = "ios"))))]
+    {
+        None
+    }
+}
+
+#[inline]
+fn read_counter() -> u64 {
+    #[cfg(all(target_arch = "aarch64", not(target_os = "ios")))]
+    {
+        let ticks: u64;
+        unsafe {
+            std::arch::asm!("mrs {}, cntvct_el0", out(reg) ticks, options(nomem, nostack, preserves_flags));
+        }
+        ticks
+    }
+    #[cfg(not(all(target_arch = "aarch64", not(target_os = "ios"))))]
+    {
+        unreachable!("counter is only read directly where it is self-describing")
     }
 }
 
