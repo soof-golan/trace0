@@ -875,6 +875,7 @@ dependencies = [
  "parking_lot",
  "quanta",
  "rtrb",
+ "windows-sys",
 ]
 
 [[package]]

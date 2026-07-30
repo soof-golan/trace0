@@ -1,20 +1,23 @@
 //! Monotonic clock with an explicit tick→nanosecond conversion.
 //!
 //! The hot path records whatever the platform's cheapest monotonic
-//! counter returns -- `cntvct_el0` on aarch64, the TSC on x86_64, and
-//! `clock_gettime` where neither is usable. Those ticks are not
-//! nanoseconds, and the conversion happens here, at drain time.
+//! counter returns -- `cntvct_el0` on aarch64, `QueryPerformanceCounter`
+//! on Windows, the TSC on x86_64, and `clock_gettime` where none of those
+//! is usable. Those ticks are not nanoseconds, and the conversion happens
+//! here, at drain time.
 //!
 //! Whatever counter is read, its scale must come from the same place.
 //! Every timebase bug this crate has had was a counter paired with a scale
-//! factor derived somewhere else.
+//! factor derived somewhere else, so each `counter` module below reads the
+//! pair from one platform API and nothing outside it can mix them up.
 //!
 //! On aarch64 that pairing is architectural: `CNTFRQ_EL0` states the rate
 //! of `CNTVCT_EL0` by definition, so the frequency is known exactly and
-//! there is nothing to measure. Everywhere else -- notably x86_64, where
-//! the TSC rate is often not discoverable at all -- [`quanta`] measures
-//! the counter against a reference clock, which costs up to 200ms once per
-//! process.
+//! there is nothing to measure. Windows makes the same promise for
+//! `QueryPerformanceFrequency` and `QueryPerformanceCounter`. Everywhere
+//! else -- notably x86_64, where the TSC rate is often not discoverable at
+//! all -- [`quanta`] measures the counter against a reference clock, which
+//! costs up to 200ms once per process.
 
 use std::sync::Arc;
 
@@ -44,7 +47,7 @@ impl Clock {
     /// first call in the process spends up to 200ms calibrating, once,
     /// globally.
     pub fn starting_now() -> Self {
-        let source = match self_describing_timebase() {
+        let source = match counter::timebase() {
             Some((nanos_num, nanos_den)) => Source::SelfDescribing {
                 nanos_num,
                 nanos_den,
@@ -125,11 +128,47 @@ impl Clock {
     }
 }
 
-/// `(nanoseconds_numerator, denominator)` for a counter that states its
-/// own rate, or `None` when the rate has to be measured.
-fn self_describing_timebase() -> Option<(u64, u64)> {
-    #[cfg(all(target_arch = "aarch64", not(target_os = "ios")))]
-    {
+/// The counter behind a self-describing clock. Only valid when
+/// [`Clock::is_direct`] said so.
+pub use counter::read as read_counter;
+
+// Exactly one `counter` below is compiled in. Each answers two questions
+// about one counter: `timebase` gives `(nanoseconds_numerator,
+// denominator)`, or `None` when the rate has to be measured instead, and
+// `read` gives what that same counter reads right now.
+
+#[cfg(target_os = "windows")]
+mod counter {
+    use windows_sys::Win32::System::Performance::{
+        QueryPerformanceCounter, QueryPerformanceFrequency,
+    };
+
+    pub fn timebase() -> Option<(u64, u64)> {
+        // QueryPerformanceFrequency reports the rate of the very counter
+        // QueryPerformanceCounter reads, fixed for the boot session.
+        let mut hz: i64 = 0;
+        if unsafe { QueryPerformanceFrequency(&mut hz) } == 0 || hz <= 0 {
+            return None;
+        }
+        Some((1_000_000_000, hz as u64))
+    }
+
+    #[inline(always)]
+    pub fn read() -> u64 {
+        let mut ticks: i64 = 0;
+        // Documented never to fail on Windows XP and later.
+        unsafe { QueryPerformanceCounter(&mut ticks) };
+        ticks as u64
+    }
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    not(target_os = "ios"),
+    not(target_os = "windows")
+))]
+mod counter {
+    pub fn timebase() -> Option<(u64, u64)> {
         // CNTFRQ_EL0 is defined as the rate of CNTVCT_EL0, so these two
         // reads cannot disagree with each other.
         let freq: u64;
@@ -142,26 +181,27 @@ fn self_describing_timebase() -> Option<(u64, u64)> {
         }
         Some((1_000_000_000, freq))
     }
-    #[cfg(not(all(target_arch = "aarch64", not(target_os = "ios"))))]
-    {
-        None
-    }
-}
 
-/// The counter behind a self-describing clock. Only valid when
-/// [`Clock::is_direct`] said so.
-#[inline(always)]
-pub fn read_counter() -> u64 {
-    #[cfg(all(target_arch = "aarch64", not(target_os = "ios")))]
-    {
+    #[inline(always)]
+    pub fn read() -> u64 {
         let ticks: u64;
         unsafe {
             std::arch::asm!("mrs {}, cntvct_el0", out(reg) ticks, options(nomem, nostack, preserves_flags));
         }
         ticks
     }
-    #[cfg(not(all(target_arch = "aarch64", not(target_os = "ios"))))]
-    {
+}
+
+#[cfg(not(any(
+    target_os = "windows",
+    all(target_arch = "aarch64", not(target_os = "ios"))
+)))]
+mod counter {
+    pub fn timebase() -> Option<(u64, u64)> {
+        None
+    }
+
+    pub fn read() -> u64 {
         unreachable!("counter is only read directly where it is self-describing")
     }
 }
@@ -200,6 +240,32 @@ mod tests {
             assert!(ns >= last, "went backwards at {ticks}");
             last = ns;
         }
+    }
+
+    /// The platforms whose counter states its own rate must say so, or
+    /// they pay [`quanta`]'s 200ms calibration on the first trace.
+    #[test]
+    #[cfg(any(
+        target_os = "windows",
+        all(target_arch = "aarch64", not(target_os = "ios"))
+    ))]
+    fn a_counter_that_states_its_own_rate_is_not_calibrated() {
+        assert!(Clock::starting_now().is_direct());
+    }
+
+    #[test]
+    fn the_direct_counter_only_moves_forward() {
+        let clock = Clock::starting_now();
+        if !clock.is_direct() {
+            return;
+        }
+        let mut last = read_counter();
+        for _ in 0..1_000 {
+            let now = read_counter();
+            assert!(now >= last, "counter went backwards: {last} then {now}");
+            last = now;
+        }
+        assert!(last > clock.start_ticks(), "counter never left the anchor");
     }
 
     #[test]

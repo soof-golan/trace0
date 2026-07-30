@@ -8,6 +8,13 @@ repository.workspace = true
 [dependencies]
 quanta.workspace = true
 ahash.workspace = true
-libc.workspace = true
 parking_lot.workspace = true
 rtrb.workspace = true
+
+# The thread id and the monotonic counter are the only platform calls this
+# crate makes, and each platform answers both from its own API.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

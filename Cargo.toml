@@ -23,3 +23,7 @@ protox = "0.9.1"
 pyo3 = { version = "0.28.3", features = ["extension-module"] }
 rtrb = "0.3.4"
 serde_json = "1.0.149"
+windows-sys = { version = "0.61.2", features = [
+    "Win32_System_Performance",
+    "Win32_System_Threading",
+] }

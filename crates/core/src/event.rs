@@ -122,7 +122,11 @@ pub fn os_tid() -> u32 {
         libc::pthread_threadid_np(0, &mut tid);
         tid as u32
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    unsafe {
+        windows_sys::Win32::System::Threading::GetCurrentThreadId()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         0
     }
@@ -179,6 +183,15 @@ mod tests {
         };
         let ev = Event::from_packed(&clock, 240, 1, p);
         assert_eq!(ev.ts_ns, 264);
+    }
+
+    #[test]
+    fn each_thread_reports_its_own_stable_id() {
+        let here = os_tid();
+        assert_ne!(here, 0, "no thread id here: every thread shares one track");
+        assert_eq!(here, os_tid(), "the id changed between two calls");
+        let there = std::thread::spawn(os_tid).join().unwrap();
+        assert_ne!(here, there, "two live threads reported the same id");
     }
 
     #[test]
