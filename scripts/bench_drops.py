@@ -29,7 +29,7 @@ def run(n_threads: int) -> dict:
     with tempfile.TemporaryDirectory() as d:
         out = Path(d) / "bench.json"
         start = time.perf_counter()
-        with Tracer(str(out), format="json"):
+        with Tracer(str(out), format="json").start():
             for t in threads:
                 t.start()
             for t in threads:

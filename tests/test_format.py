@@ -18,10 +18,8 @@ def work() -> None:
 
 
 def trace_to(path, **kwargs) -> None:
-    tracer = Tracer(str(path), **kwargs)
-    tracer.start()
-    work()
-    tracer.stop()
+    with Tracer(str(path), **kwargs).start():
+        work()
 
 
 def test_the_default_format_is_protobuf(tmp_path):

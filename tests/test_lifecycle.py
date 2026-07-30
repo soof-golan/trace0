@@ -1,10 +1,13 @@
-"""Starting, stopping, and restarting a tracer inside one process.
+"""`Tracer` is configuration; `Tracer.start()` hands back a running
+`Session`. Splitting them removes the states a single object had to
+represent and reject: built but not started, started twice, stopped
+without starting.
 
-A second `Tracer` builds a fresh queue, interner and thread registry, but
-the threads that traced the first run still hold the per-thread state it
-left behind: a write cursor into the old run's batch, a cached code id
-from the old run's numbering, and a thread already marked as named. Each
-of those was a shipped bug.
+What remains is the interesting one. A second `Session` builds a fresh
+queue, interner and thread registry, but the threads that traced the
+first still hold the per-thread state it left behind: a write cursor
+into the old batch, a cached code id from the old numbering, and a
+thread already marked as named. Each of those was a shipped bug.
 """
 
 import json
@@ -41,12 +44,19 @@ def test_every_thread_that_traced_the_first_run_traces_the_second(traced):
 
 
 def test_the_second_run_resolves_names_against_its_own_interner(traced):
-    def named_workload():
-        work()
-
-    first = {e["name"] for e in phase(traced(named_workload), "B")}
-    second = {e["name"] for e in phase(traced(named_workload), "B")}
+    first = {e["name"] for e in phase(traced(work), "B")}
+    second = {e["name"] for e in phase(traced(work), "B")}
     assert first == second
+
+
+def test_one_tracer_starts_as_many_sessions_as_asked(tmp_path):
+    """The config carries no run state, so it is reusable by construction."""
+    tracer = Tracer(str(tmp_path / "reused.json"), format="json")
+    for _ in range(3):
+        session = tracer.start()
+        work()
+        session.stop()
+    assert phase(json.loads((tmp_path / "reused.json").read_text()), "B")
 
 
 def test_repeated_start_stop_cycles_stay_sound(tmp_path):
@@ -55,12 +65,10 @@ def test_repeated_start_stop_cycles_stay_sound(tmp_path):
     rather than through the cursor of one already shipped."""
     for i in range(25):
         path = tmp_path / f"cycle{i}.json"
-        tracer = Tracer(str(path), format="json")
-        tracer.start()
+        session = Tracer(str(path), format="json").start()
         work()
-        tracer.stop()
-        trace = json.loads(path.read_text())
-        assert trace["droppedEvents"] == 0
+        session.stop()
+        assert json.loads(path.read_text())["droppedEvents"] == 0
 
 
 def test_no_event_precedes_the_clock_anchor(traced):
@@ -70,24 +78,28 @@ def test_no_event_precedes_the_clock_anchor(traced):
     assert all(e["ts"] >= 0 for e in timed)
 
 
-def test_starting_a_running_tracer_is_refused(tmp_path):
-    tracer = Tracer(str(tmp_path / "t.json"), format="json")
-    tracer.start()
+def test_a_second_session_cannot_run_beside_the_first(tmp_path):
+    """sys.monitoring hands out one PROFILER_ID, so overlapping sessions
+    are refused by the interpreter rather than by us."""
+    session = Tracer(str(tmp_path / "a.json"), format="json").start()
     try:
-        with pytest.raises(RuntimeError, match="already started"):
-            tracer.start()
+        with pytest.raises(ValueError):
+            Tracer(str(tmp_path / "b.json"), format="json").start()
     finally:
-        tracer.stop()
+        session.stop()
 
 
-def test_stopping_a_tracer_that_never_ran_is_refused(tmp_path):
-    tracer = Tracer(str(tmp_path / "t.json"), format="json")
-    with pytest.raises(RuntimeError, match="not running"):
-        tracer.stop()
+def test_stopping_a_session_twice_is_harmless(tmp_path):
+    path = tmp_path / "twice.json"
+    session = Tracer(str(path), format="json").start()
+    work()
+    session.stop()
+    session.stop()
+    assert phase(json.loads(path.read_text()), "B")
 
 
-def test_the_context_manager_traces_and_closes(tmp_path):
+def test_the_session_is_the_context_manager(tmp_path):
     path = tmp_path / "ctx.json"
-    with Tracer(str(path), format="json"):
+    with Tracer(str(path), format="json").start():
         work()
     assert phase(json.loads(path.read_text()), "B")

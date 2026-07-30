@@ -18,12 +18,8 @@ def traced(tmp_path: Path):
 
     def run(workload) -> dict:
         path = tmp_path / f"trace{next(counter)}.json"
-        tracer = Tracer(str(path), format="json")
-        tracer.start()
-        try:
+        with Tracer(str(path), format="json").start():
             workload()
-        finally:
-            tracer.stop()
         return json.loads(path.read_text())
 
     return run

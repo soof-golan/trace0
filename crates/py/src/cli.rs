@@ -61,11 +61,11 @@ fn run(py: Python<'_>, a: RunArgs) -> PyResult<i32> {
     let new_argv = PyList::new(py, argv_items)?;
     sys.setattr("argv", &new_argv)?;
 
-    tracer.start(py)?;
+    let session = tracer.start(py)?;
     let run_result = py
         .import("runpy")
         .and_then(|m| m.call_method1("run_path", (a.script.as_str(), py.None(), "__main__")));
-    let stop_result = tracer.stop(py);
+    let stop_result = session.stop(py);
 
     sys.setattr("argv", saved_argv)?;
 

@@ -27,8 +27,7 @@ def worker() -> None:
 def trace_to(path: Path) -> tuple[dict, float]:
     """Trace the workload, and time it independently of the tracer."""
     workers = [threading.Thread(target=worker, name=f"w{i}") for i in range(3)]
-    tracer = Tracer(str(path), format="json")
-    tracer.start()
+    session = Tracer(str(path), format="json").start()
     # Timed from inside the tracer: clock calibration and the final drain
     # are real costs, but they are not part of any slice.
     started = time.perf_counter()
@@ -38,7 +37,7 @@ def trace_to(path: Path) -> tuple[dict, float]:
     for t in workers:
         t.join()
     wall = time.perf_counter() - started
-    tracer.stop()
+    session.stop()
     return json.loads(path.read_text()), wall
 
 

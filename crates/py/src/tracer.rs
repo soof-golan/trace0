@@ -13,17 +13,16 @@ use trace0_core::{
     tls::{COLD, hot},
 };
 
-struct RunningHandle {
+struct Running {
     queue: Arc<EventQueue>,
     monitoring: MonitoringHandle,
-    exporter_thread: Option<thread::JoinHandle<std::io::Result<()>>>,
+    exporter: thread::JoinHandle<std::io::Result<()>>,
 }
 
-#[pyclass(module = "trace0._core")]
+#[pyclass(module = "trace0._core", frozen)]
 pub struct Tracer {
     output: String,
     format: Format,
-    handle: Mutex<Option<RunningHandle>>,
 }
 
 #[pymethods]
@@ -34,16 +33,10 @@ impl Tracer {
         Ok(Self {
             output,
             format: Format::parse(&format).map_err(PyValueError::new_err)?,
-            handle: Mutex::new(None),
         })
     }
 
-    pub(crate) fn start(&self, py: Python<'_>) -> PyResult<()> {
-        let mut slot = self.handle.lock();
-        if slot.is_some() {
-            return Err(PyRuntimeError::new_err("tracer already started"));
-        }
-
+    pub(crate) fn start(&self, py: Python<'_>) -> PyResult<Session> {
         let queue = Arc::new(EventQueue::new(Clock::starting_now()));
         let state = Arc::new(State {
             run: queue.id(),
@@ -52,55 +45,72 @@ impl Tracer {
             threads: ThreadRegistry::new(),
         });
 
-        let exporter = self
+        let exporter_sink = self
             .format
             .open(&self.output)
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
-        let exporter_thread = {
+        let exporter = {
             let queue = queue.clone();
             let codes: Arc<dyn CodeLookup> = state.clone();
             let names: Arc<dyn ThreadNames> = state.clone();
             thread::Builder::new()
                 .name("trace0-exporter".into())
-                .spawn(move || run_pipeline(queue, codes, names, exporter))
+                .spawn(move || run_pipeline(queue, codes, names, exporter_sink))
                 .map_err(|e| PyRuntimeError::new_err(format!("spawn exporter: {e}")))?
         };
 
-        let mh = monitoring::enable(py, state)?;
-
-        *slot = Some(RunningHandle {
-            queue,
-            monitoring: mh,
-            exporter_thread: Some(exporter_thread),
-        });
-        Ok(())
-    }
-
-    pub(crate) fn stop(&self, py: Python<'_>) -> PyResult<()> {
-        let mut slot = self.handle.lock();
-        let Some(mut h) = slot.take() else {
-            return Err(PyRuntimeError::new_err("tracer not running"));
+        let monitoring = match monitoring::enable(py, state) {
+            Ok(handle) => handle,
+            Err(e) => {
+                queue.close();
+                let _ = py.detach(move || exporter.join());
+                return Err(e);
+            }
         };
 
-        monitoring::disable(py, &h.monitoring)?;
+        Ok(Session {
+            running: Mutex::new(Some(Running {
+                queue,
+                monitoring,
+                exporter,
+            })),
+        })
+    }
+}
+
+#[pyclass(module = "trace0._core", frozen)]
+pub struct Session {
+    running: Mutex<Option<Running>>,
+}
+
+#[pymethods]
+impl Session {
+    pub(crate) fn stop(&self, py: Python<'_>) -> PyResult<()> {
+        let Some(running) = self.running.lock().take() else {
+            return Ok(());
+        };
+        let Running {
+            queue,
+            monitoring,
+            exporter,
+        } = running;
+
+        let disabled = monitoring::disable(py, &monitoring);
         COLD.with_borrow_mut(|cold| cold.flush_partial(hot()));
-        h.queue.close();
+        queue.close();
+        let joined = py.detach(move || exporter.join());
 
-        let join = h.exporter_thread.take();
-        let joined: Option<std::io::Result<()>> =
-            py.detach(move || join.and_then(|t| t.join().ok()));
-
+        disabled?;
         match joined {
-            Some(Ok(())) => Ok(()),
-            Some(Err(e)) => Err(PyIOError::new_err(e.to_string())),
-            None => Err(PyRuntimeError::new_err("exporter thread panicked")),
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(PyIOError::new_err(e.to_string())),
+            Err(_) => Err(PyRuntimeError::new_err("exporter thread panicked")),
         }
     }
 
-    fn __enter__<'py>(slf: PyRef<'py, Self>, py: Python<'py>) -> PyResult<PyRef<'py, Self>> {
-        slf.start(py)?;
-        Ok(slf)
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
     }
 
     fn __exit__(
