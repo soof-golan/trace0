@@ -11,11 +11,22 @@ message TracePacket {
   optional InternedData interned_data = 12;
   // SequenceFlags: 1 = incremental state cleared, 2 = needs incremental state.
   optional uint32 sequence_flags = 13;
+  optional TracePacketDefaults trace_packet_defaults = 59;
 
   oneof data {
     TrackEvent track_event = 11;
     TrackDescriptor track_descriptor = 60;
   }
+}
+
+// Values every packet on a sequence inherits, so they travel once per
+// sequence instead of once per event.
+message TracePacketDefaults {
+  optional TrackEventDefaults track_event_defaults = 11;
+}
+
+message TrackEventDefaults {
+  optional uint64 track_uuid = 11;
 }
 
 message InternedData {

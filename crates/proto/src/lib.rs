@@ -9,17 +9,17 @@ pub mod pb {
 }
 
 const PACKET_TAG: u8 = (1 << 3) | 2;
-const SEQUENCE_ID: u32 = 1;
+const PROCESS_SEQUENCE_ID: u32 = 1;
 const CATEGORY: &str = "py";
 
 mod tag {
     pub const TIMESTAMP: u8 = 8 << 3;
     pub const TRACK_EVENT: u8 = (11 << 3) | 2;
     pub const TYPE: u8 = 9 << 3;
-    pub const TRACK_UUID: u8 = 11 << 3;
     pub const CATEGORY_IIDS: u8 = 3 << 3;
     pub const NAME_IID: u8 = 10 << 3;
     pub const SEQUENCE_FLAGS: u8 = 13 << 3;
+    pub const SEQUENCE_ID: u8 = 10 << 3;
 }
 
 const SEQ_INCREMENTAL_STATE_CLEARED: u32 = 1;
@@ -29,7 +29,15 @@ const NEEDS_STATE_FIELD: [u8; 2] = [tag::SEQUENCE_FLAGS, SEQ_NEEDS_INCREMENTAL_S
 
 const CATEGORY_IID: u64 = 1;
 
-const SEQUENCE_FIELD: [u8; 2] = [10 << 3, SEQUENCE_ID as u8];
+/// One packet sequence per thread. Perfetto lets a sequence declare a default
+/// track, so events on it need not name their own -- which is what makes a
+/// globally unique track uuid affordable, since the uuid travels once per
+/// thread instead of once per event.
+struct Sequence {
+    id: u32,
+    header: Vec<u8>,
+    name_iids: ahash::AHashMap<u32, u64>,
+}
 
 pub struct ProtoExporter<W: Write + Send> {
     out: W,
@@ -37,11 +45,16 @@ pub struct ProtoExporter<W: Write + Send> {
     buf: Vec<u8>,
     templates: ahash::AHashMap<u64, (u32, u32)>,
     template_bytes: Vec<u8>,
-    name_iids: ahash::AHashMap<u32, u64>,
-    track_uuids: ahash::AHashMap<u32, u64>,
-    seen_tids: ahash::AHashSet<u32>,
+    sequences: ahash::AHashMap<u32, Sequence>,
     process_emitted: bool,
     pid: i32,
+    process_uuid: u64,
+}
+
+/// Track uuids must not collide between processes whose traces are merged
+/// into one file, so each process owns the uuid block named by its pid.
+fn process_uuid_of(pid: i32) -> u64 {
+    ((pid as u32 as u64) << 32) | 1
 }
 
 impl ProtoExporter<BufWriter<File>> {
@@ -59,16 +72,16 @@ impl<W: Write + Send> ProtoExporter<W> {
             buf: Vec::with_capacity(1 << 18),
             templates: ahash::AHashMap::new(),
             template_bytes: Vec::with_capacity(1 << 12),
-            name_iids: ahash::AHashMap::new(),
-            track_uuids: ahash::AHashMap::new(),
-            seen_tids: ahash::AHashSet::new(),
+            sequences: ahash::AHashMap::new(),
             process_emitted: false,
             pid: std::process::id() as i32,
+            process_uuid: process_uuid_of(std::process::id() as i32),
         }
     }
 
     pub fn with_pid(mut self, pid: i32) -> Self {
         self.pid = pid;
+        self.process_uuid = process_uuid_of(pid);
         self
     }
 
@@ -86,19 +99,21 @@ impl<W: Write + Send> ProtoExporter<W> {
         self.out.write_all(&self.scratch)
     }
 
-    fn name_iid(&mut self, code_id: u32, codes: &dyn CodeLookup) -> io::Result<u64> {
-        if let Some(&iid) = self.name_iids.get(&code_id) {
+    fn name_iid(&mut self, tid: u32, code_id: u32, codes: &dyn CodeLookup) -> io::Result<u64> {
+        let seq = &self.sequences[&tid];
+        if let Some(&iid) = seq.name_iids.get(&code_id) {
             return Ok(iid);
         }
-        let iid = self.name_iids.len() as u64 + 1;
+        let (iid, seq_id) = (seq.name_iids.len() as u64 + 1, seq.id);
         let name = codes
             .code(code_id)
             .map(|i| i.qualname)
             .unwrap_or_else(|| "<unknown>".into());
         self.write_packet(&pb::TracePacket {
             timestamp: Some(0),
-            trusted_packet_sequence_id: Some(SEQUENCE_ID),
+            trusted_packet_sequence_id: Some(seq_id),
             sequence_flags: Some(SEQ_NEEDS_INCREMENTAL_STATE),
+            trace_packet_defaults: None,
             interned_data: Some(pb::InternedData {
                 event_names: vec![pb::EventName {
                     iid: Some(iid),
@@ -108,7 +123,11 @@ impl<W: Write + Send> ProtoExporter<W> {
             }),
             data: None,
         })?;
-        self.name_iids.insert(code_id, iid);
+        self.sequences
+            .get_mut(&tid)
+            .expect("sequence exists")
+            .name_iids
+            .insert(code_id, iid);
         Ok(iid)
     }
 
@@ -125,8 +144,6 @@ impl<W: Write + Send> ProtoExporter<W> {
             return Ok(range);
         }
 
-        let uuid = self.track_uuid(tid);
-
         let mut event = Vec::with_capacity(32);
         event.push(tag::TYPE);
         event.push(if opens {
@@ -134,10 +151,8 @@ impl<W: Write + Send> ProtoExporter<W> {
         } else {
             pb::track_event::Type::SliceEnd as u8
         });
-        event.push(tag::TRACK_UUID);
-        event.extend_from_slice(Varint::of(uuid).as_slice());
         if opens {
-            let name_iid = self.name_iid(code_id, codes)?;
+            let name_iid = self.name_iid(tid, code_id, codes)?;
             event.push(tag::CATEGORY_IIDS);
             event.extend_from_slice(Varint::of(CATEGORY_IID).as_slice());
             event.push(tag::NAME_IID);
@@ -145,6 +160,8 @@ impl<W: Write + Send> ProtoExporter<W> {
         }
 
         let start = self.template_bytes.len() as u32;
+        let header = self.sequences[&tid].header.clone();
+        self.template_bytes.extend_from_slice(&header);
         self.template_bytes.push(tag::TRACK_EVENT);
         self.template_bytes
             .extend_from_slice(Varint::of(event.len() as u64).as_slice());
@@ -159,15 +176,12 @@ impl<W: Write + Send> ProtoExporter<W> {
         let ts = Varint::of(ts_ns);
         let (start, len) = template;
 
-        let body_len =
-            1 + ts.as_slice().len() + SEQUENCE_FIELD.len() + NEEDS_STATE_FIELD.len() + len as usize;
+        let body_len = 1 + ts.as_slice().len() + len as usize;
         self.buf.push(PACKET_TAG);
         self.buf
             .extend_from_slice(Varint::of(body_len as u64).as_slice());
         self.buf.push(tag::TIMESTAMP);
         self.buf.extend_from_slice(ts.as_slice());
-        self.buf.extend_from_slice(&SEQUENCE_FIELD);
-        self.buf.extend_from_slice(&NEEDS_STATE_FIELD);
         let (a, b) = (start as usize, (start + len) as usize);
         self.buf.extend_from_slice(&self.template_bytes[a..b]);
     }
@@ -180,18 +194,13 @@ impl<W: Write + Send> ProtoExporter<W> {
         let pid = self.pid;
         let pkt = pb::TracePacket {
             timestamp: Some(0),
-            trusted_packet_sequence_id: Some(SEQUENCE_ID),
+            trusted_packet_sequence_id: Some(PROCESS_SEQUENCE_ID),
             sequence_flags: Some(SEQ_INCREMENTAL_STATE_CLEARED),
-            interned_data: Some(pb::InternedData {
-                event_categories: vec![pb::EventCategory {
-                    iid: Some(CATEGORY_IID),
-                    name: Some(CATEGORY.into()),
-                }],
-                event_names: vec![],
-            }),
+            trace_packet_defaults: None,
+            interned_data: None,
             data: Some(pb::trace_packet::Data::TrackDescriptor(
                 pb::TrackDescriptor {
-                    uuid: Some(PROCESS_UUID),
+                    uuid: Some(self.process_uuid),
                     name: Some(format!("python:{pid}")),
                     process: Some(pb::ProcessDescriptor {
                         pid: Some(pid),
@@ -204,26 +213,40 @@ impl<W: Write + Send> ProtoExporter<W> {
         self.write_packet(&pkt)
     }
 
-    fn track_uuid(&mut self, tid: u32) -> u64 {
-        let next = self.track_uuids.len() as u64 + PROCESS_UUID + 1;
-        *self.track_uuids.entry(tid).or_insert(next)
-    }
-
-    fn ensure_thread(&mut self, tid: u32, threads: &dyn ThreadNames) -> io::Result<()> {
-        if !self.seen_tids.insert(tid) {
+    fn ensure_sequence(&mut self, tid: u32, threads: &dyn ThreadNames) -> io::Result<()> {
+        if self.sequences.contains_key(&tid) {
             return Ok(());
         }
-        let uuid = self.track_uuid(tid);
+        let index = self.sequences.len() as u64;
+        let id = PROCESS_SEQUENCE_ID + 1 + index as u32;
+        let track_uuid = self.process_uuid + 1 + index;
+
+        let mut header = Vec::with_capacity(4);
+        header.push(tag::SEQUENCE_ID);
+        header.extend_from_slice(Varint::of(id as u64).as_slice());
+        header.extend_from_slice(&NEEDS_STATE_FIELD);
+
         let pid = self.pid;
         let pkt = pb::TracePacket {
             timestamp: Some(0),
-            trusted_packet_sequence_id: Some(SEQUENCE_ID),
-            interned_data: None,
-            sequence_flags: None,
+            trusted_packet_sequence_id: Some(id),
+            sequence_flags: Some(SEQ_INCREMENTAL_STATE_CLEARED),
+            trace_packet_defaults: Some(pb::TracePacketDefaults {
+                track_event_defaults: Some(pb::TrackEventDefaults {
+                    track_uuid: Some(track_uuid),
+                }),
+            }),
+            interned_data: Some(pb::InternedData {
+                event_categories: vec![pb::EventCategory {
+                    iid: Some(CATEGORY_IID),
+                    name: Some(CATEGORY.into()),
+                }],
+                event_names: vec![],
+            }),
             data: Some(pb::trace_packet::Data::TrackDescriptor(
                 pb::TrackDescriptor {
-                    uuid: Some(uuid),
-                    parent_uuid: Some(PROCESS_UUID),
+                    uuid: Some(track_uuid),
+                    parent_uuid: Some(self.process_uuid),
                     thread: Some(pb::ThreadDescriptor {
                         pid: Some(pid),
                         tid: Some(tid as i32),
@@ -233,7 +256,16 @@ impl<W: Write + Send> ProtoExporter<W> {
                 },
             )),
         };
-        self.write_packet(&pkt)
+        self.write_packet(&pkt)?;
+        self.sequences.insert(
+            tid,
+            Sequence {
+                id,
+                header,
+                name_iids: ahash::AHashMap::new(),
+            },
+        );
+        Ok(())
     }
 }
 
@@ -266,8 +298,6 @@ impl Varint {
     }
 }
 
-const PROCESS_UUID: u64 = 1;
-
 impl<W: Write + Send> Exporter for ProtoExporter<W> {
     fn write_batch(
         &mut self,
@@ -278,7 +308,7 @@ impl<W: Write + Send> Exporter for ProtoExporter<W> {
         self.ensure_process()?;
         self.buf.clear();
         for ev in events {
-            self.ensure_thread(ev.tid, threads)?;
+            self.ensure_sequence(ev.tid, threads)?;
             let template = self.template(ev.tid, ev.code_id(), ev.kind().opens_slice(), codes)?;
             self.push_event(ev.ts_ns, template);
         }
@@ -295,12 +325,13 @@ impl<W: Write + Send> Exporter for ProtoExporter<W> {
             self.ensure_process()?;
             let pkt = pb::TracePacket {
                 timestamp: Some(0),
-                trusted_packet_sequence_id: Some(SEQUENCE_ID),
+                trusted_packet_sequence_id: Some(PROCESS_SEQUENCE_ID),
                 interned_data: None,
                 sequence_flags: None,
+                trace_packet_defaults: None,
                 data: Some(pb::trace_packet::Data::TrackEvent(pb::TrackEvent {
                     r#type: Some(pb::track_event::Type::Instant as i32),
-                    track_uuid: Some(PROCESS_UUID),
+                    track_uuid: Some(self.process_uuid),
                     name: Some(format!("trace0: {dropped} events dropped")),
                     categories: vec!["py".into(), "dropped".into()],
                     category_iids: vec![],
@@ -374,19 +405,26 @@ mod tests {
             .collect()
     }
 
-    fn interned_names(pkts: &[pb::TracePacket]) -> std::collections::HashMap<u64, String> {
+    /// Interned ids are scoped to their sequence: iid 1 on one thread's
+    /// sequence names a different function than iid 1 on another's.
+    fn interned_names(pkts: &[pb::TracePacket]) -> std::collections::HashMap<(u32, u64), String> {
         pkts.iter()
-            .filter_map(|p| p.interned_data.as_ref())
-            .flat_map(|d| d.event_names.iter())
-            .map(|n| (n.iid.unwrap(), n.name.clone().unwrap()))
+            .flat_map(|p| {
+                let seq = p.trusted_packet_sequence_id.unwrap();
+                p.interned_data
+                    .iter()
+                    .flat_map(|d| d.event_names.iter())
+                    .map(move |n| ((seq, n.iid.unwrap()), n.name.clone().unwrap()))
+            })
             .collect()
     }
 
-    fn event_name(pkts: &[pb::TracePacket], te: &pb::TrackEvent) -> String {
+    fn event_name(pkts: &[pb::TracePacket], seq: u32, te: &pb::TrackEvent) -> String {
         let names = interned_names(pkts);
+        let key = (seq, te.name_iid.unwrap());
         names
-            .get(&te.name_iid.unwrap())
-            .unwrap_or_else(|| panic!("name_iid {:?} was never interned", te.name_iid))
+            .get(&key)
+            .unwrap_or_else(|| panic!("name_iid {key:?} was never interned"))
             .clone()
     }
 
@@ -397,6 +435,38 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The track each sequence declared as its default, which is where every
+    /// event on that sequence lands.
+    fn sequence_tracks(pkts: &[pb::TracePacket]) -> std::collections::HashMap<u32, u64> {
+        pkts.iter()
+            .filter_map(|p| {
+                let uuid = p
+                    .trace_packet_defaults
+                    .as_ref()?
+                    .track_event_defaults
+                    .as_ref()?
+                    .track_uuid?;
+                Some((p.trusted_packet_sequence_id?, uuid))
+            })
+            .collect()
+    }
+
+    fn events_by_sequence(pkts: &[pb::TracePacket]) -> Vec<(u32, &pb::TrackEvent)> {
+        pkts.iter()
+            .filter_map(|p| match p.data.as_ref() {
+                Some(pb::trace_packet::Data::TrackEvent(te)) => {
+                    Some((p.trusted_packet_sequence_id.unwrap(), te))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Where an event actually lands: its sequence's default track.
+    fn track_of(pkts: &[pb::TracePacket], seq: u32) -> u64 {
+        sequence_tracks(pkts)[&seq]
     }
 
     #[test]
@@ -443,10 +513,10 @@ mod tests {
         let pkts = packets(&raw);
         let names = interned_names(&pkts);
         assert_eq!(names.len(), 2);
-        let resolved: Vec<_> = track_events(&pkts)
+        let resolved: Vec<_> = events_by_sequence(&pkts)
             .iter()
-            .filter(|te| te.r#type == Some(pb::track_event::Type::SliceBegin as i32))
-            .map(|te| names[&te.name_iid.unwrap()].clone())
+            .filter(|(_, te)| te.r#type == Some(pb::track_event::Type::SliceBegin as i32))
+            .map(|(seq, te)| names[&(*seq, te.name_iid.unwrap())].clone())
             .collect();
         assert_eq!(resolved, vec!["alpha", "beta"]);
     }
@@ -470,25 +540,39 @@ mod tests {
             .expect("no slice end");
         assert_eq!(end.name_iid, None);
         assert!(end.category_iids.is_empty());
-        assert!(end.track_uuid.is_some());
+        assert!(end.track_uuid.is_none());
     }
 
     #[test]
-    fn track_uuids_stay_small_enough_to_encode_in_one_byte() {
-        let mut threads = ThreadTable::new();
-        threads.insert(4242, "worker");
+    fn an_event_carries_no_track_of_its_own() {
         let raw = export(
-            &[Event::new(0, 4242, 0, EventKind::Begin)],
+            &[
+                Event::new(0, 4242, 0, EventKind::Begin),
+                Event::new(5, 4242, 0, EventKind::End),
+            ],
             &fib_table(),
             &ThreadTable::new(),
             0,
         );
         let pkts = packets(&raw);
-        for te in track_events(&pkts) {
-            let uuid = te.track_uuid.unwrap();
-            assert!(uuid < 128, "uuid {uuid} needs more than one varint byte");
+        let evs = events_by_sequence(&pkts);
+        assert_eq!(evs.len(), 2);
+        for (seq, te) in &evs {
+            assert!(te.track_uuid.is_none(), "track repeated on the event");
+            assert_ne!(track_of(&pkts, *seq), 0, "sequence declared no track");
         }
-        let _ = threads;
+    }
+
+    #[test]
+    fn sequence_ids_stay_small_enough_to_encode_in_one_byte() {
+        let events: Vec<_> = (0..40)
+            .map(|i| Event::new(i, i as u32, 0, EventKind::Begin))
+            .collect();
+        let raw = export(&events, &fib_table(), &ThreadTable::new(), 0);
+        for p in packets(&raw) {
+            let seq = p.trusted_packet_sequence_id.unwrap();
+            assert!(seq < 128, "sequence {seq} needs more than one varint byte");
+        }
     }
 
     #[test]
@@ -542,17 +626,21 @@ mod tests {
             .filter_map(|d| d.thread.as_ref().map(|t| (t.tid() as u32, d.uuid())))
             .collect();
 
-        let tes = track_events(&pkts);
+        let tes = events_by_sequence(&pkts);
         assert_eq!(tes.len(), events.len());
-        for (ev, te) in events.iter().zip(&tes) {
+        for (ev, (seq, te)) in events.iter().zip(&tes) {
             assert_eq!(
-                te.track_uuid(),
+                track_of(&pkts, *seq),
                 uuid_of[&ev.tid],
                 "an event landed on another thread's track"
             );
             if ev.kind().opens_slice() {
                 let want = ["a", "b", "c"][ev.code_id() as usize];
-                assert_eq!(event_name(&pkts, te), want, "a memo served a stale name");
+                assert_eq!(
+                    event_name(&pkts, *seq, te),
+                    want,
+                    "a memo served a stale name"
+                );
             }
         }
     }
@@ -580,8 +668,8 @@ mod tests {
             0,
         );
         let pkts = packets(&raw);
-        let te = track_events(&pkts)[0];
-        assert_eq!(event_name(&pkts, te).len(), 400);
+        let (seq, te) = events_by_sequence(&pkts)[0];
+        assert_eq!(event_name(&pkts, seq, te).len(), 400);
     }
 
     #[test]
@@ -676,7 +764,10 @@ mod tests {
             &ThreadTable::new(),
             0,
         );
-        let mut iids: Vec<u64> = interned_names(&packets(&raw)).into_keys().collect();
+        let mut iids: Vec<u64> = interned_names(&packets(&raw))
+            .into_keys()
+            .map(|(_, iid)| iid)
+            .collect();
         iids.sort();
         assert_eq!(iids, vec![1, 2], "zero is Perfetto's \"unset\"");
     }
@@ -696,12 +787,43 @@ mod tests {
         let pkts = packets(&raw);
         let ds = descriptors(&pkts);
         let proc = ds.iter().find(|d| d.process.is_some()).unwrap();
-        assert_eq!(proc.uuid, Some(1));
+        let base = proc.uuid.unwrap();
         let assigned: Vec<(i32, u64)> = ds
             .iter()
             .filter_map(|d| Some((d.thread.as_ref()?.tid?, d.uuid?)))
             .collect();
-        assert_eq!(assigned, vec![(30, 2), (10, 3), (20, 4)]);
+        assert_eq!(
+            assigned,
+            vec![(30, base + 1), (10, base + 2), (20, base + 3)]
+        );
+    }
+
+    #[test]
+    fn two_processes_never_share_a_track_uuid() {
+        let events = [
+            Event::new(0, 10, 0, EventKind::Begin),
+            Event::new(1, 20, 0, EventKind::Begin),
+        ];
+        let uuids = |pid: i32| -> std::collections::HashSet<u64> {
+            let mut buf = Vec::new();
+            {
+                let mut ex = ProtoExporter::new(&mut buf).with_pid(pid);
+                ex.write_batch(&events, &fib_table(), &ThreadTable::new())
+                    .unwrap();
+                ex.finish(&fib_table(), &ThreadTable::new(), 0).unwrap();
+            }
+            descriptors(&packets(&buf))
+                .iter()
+                .filter_map(|d| d.uuid)
+                .collect()
+        };
+        let (a, b) = (uuids(4242), uuids(4243));
+        assert_eq!(a.len(), 3, "one process track and two thread tracks");
+        assert!(
+            a.is_disjoint(&b),
+            "two processes claimed the same track: {:?}",
+            a.intersection(&b).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -717,7 +839,53 @@ mod tests {
         let proc = ds.iter().find(|d| d.process.is_some()).unwrap();
         let thread = ds.iter().find(|d| d.thread.is_some()).unwrap();
         assert_eq!(thread.parent_uuid, proc.uuid);
-        assert_eq!(track_events(&pkts)[0].track_uuid, thread.uuid);
+        let (seq, _) = events_by_sequence(&pkts)[0];
+        assert_eq!(track_of(&pkts, seq), thread.uuid.unwrap());
+    }
+
+    #[test]
+    fn each_thread_gets_its_own_sequence() {
+        let raw = export(
+            &[
+                Event::new(0, 10, 0, EventKind::Begin),
+                Event::new(1, 20, 0, EventKind::Begin),
+                Event::new(2, 10, 0, EventKind::End),
+            ],
+            &fib_table(),
+            &ThreadTable::new(),
+            0,
+        );
+        let pkts = packets(&raw);
+        let evs = events_by_sequence(&pkts);
+        assert_eq!(evs[0].0, evs[2].0, "one thread, one sequence");
+        assert_ne!(evs[0].0, evs[1].0, "two threads shared a sequence");
+        assert_ne!(track_of(&pkts, evs[0].0), track_of(&pkts, evs[1].0));
+    }
+
+    #[test]
+    fn every_sequence_opens_by_clearing_incremental_state() {
+        let raw = export(
+            &[
+                Event::new(0, 10, 0, EventKind::Begin),
+                Event::new(1, 20, 0, EventKind::Begin),
+            ],
+            &fib_table(),
+            &ThreadTable::new(),
+            0,
+        );
+        let pkts = packets(&raw);
+        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for p in &pkts {
+            let seq = p.trusted_packet_sequence_id.unwrap();
+            if seen.insert(seq) {
+                assert_eq!(
+                    p.sequence_flags,
+                    Some(SEQ_INCREMENTAL_STATE_CLEARED),
+                    "sequence {seq} started without clearing its state"
+                );
+            }
+        }
+        assert!(seen.len() >= 3, "a process sequence and one per thread");
     }
 
     #[test]
@@ -746,7 +914,7 @@ mod tests {
             0,
         );
         let pkts = packets(&raw);
-        let te = track_events(&pkts)[0];
-        assert_eq!(event_name(&pkts, te), "<unknown>");
+        let (seq, te) = events_by_sequence(&pkts)[0];
+        assert_eq!(event_name(&pkts, seq, te), "<unknown>");
     }
 }
