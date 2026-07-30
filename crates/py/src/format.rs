@@ -25,10 +25,13 @@ impl Format {
         }
     }
 
-    pub fn open(self, path: &str) -> io::Result<Box<dyn Exporter>> {
+    /// `slot` namespaces a child's packet sequences away from every other
+    /// process merged into the same trace. The JSON format needs no such thing:
+    /// its events carry a pid outright.
+    pub fn open(self, path: &str, slot: u32) -> io::Result<Box<dyn Exporter>> {
         Ok(match self {
             Format::Json => Box::new(JsonExporter::create(path)?),
-            Format::Protobuf => Box::new(ProtoExporter::create(path)?),
+            Format::Protobuf => Box::new(ProtoExporter::create(path)?.with_slot(slot)),
         })
     }
 }

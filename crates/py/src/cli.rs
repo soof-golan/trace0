@@ -94,7 +94,7 @@ fn run(py: Python<'_>, a: RunArgs) -> PyResult<i32> {
         script,
         script_args,
     } = a;
-    let tracer = Tracer::new(output, format.as_str().to_string())?;
+    let tracer = Py::new(py, Tracer::new(output, format.as_str().to_string())?)?;
     let (target, args, argv0) = split_target(module, script, script_args);
 
     let sys = py.import("sys")?;
@@ -106,7 +106,8 @@ fn run(py: Python<'_>, a: RunArgs) -> PyResult<i32> {
     sys.setattr("argv", &new_argv)?;
 
     let runpy = py.import("runpy")?;
-    let running = tracer.begin(py)?;
+    let tracer = tracer.bind(py);
+    Tracer::__enter__(tracer, py)?;
     let run_result = match &target {
         Target::Script(path) => {
             runpy.call_method1("run_path", (path.as_str(), py.None(), "__main__"))
@@ -120,7 +121,7 @@ fn run(py: Python<'_>, a: RunArgs) -> PyResult<i32> {
             })
         }
     };
-    let stop_result = Tracer::end(py, running);
+    let stop_result = tracer.get().__exit__(py, None, None, None);
 
     sys.setattr("argv", saved_argv)?;
 

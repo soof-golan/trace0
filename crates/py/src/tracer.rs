@@ -15,9 +15,18 @@ use trace0_core::{
 
 pub(crate) struct Running {
     queue: Arc<EventQueue>,
-    monitoring: MonitoringHandle,
+    state: Arc<State>,
+    /// Empty only while a fork is in flight, when callbacks must not run.
+    monitoring: Option<MonitoringHandle>,
     exporter: thread::JoinHandle<std::io::Result<()>>,
 }
+
+/// The tracer a forking process must hand over to its child. A fork clones one
+/// thread, so the child inherits an exporter thread that does not exist and
+/// locks no one will release; every hook below exists to keep the child from
+/// touching any of it.
+static ACTIVE: Mutex<Option<Py<Tracer>>> = Mutex::new(None);
+static HOOKS_REGISTERED: std::sync::Once = std::sync::Once::new();
 
 #[pyclass(module = "trace0._core", frozen)]
 pub struct Tracer {
@@ -28,6 +37,17 @@ pub struct Tracer {
 
 impl Tracer {
     pub(crate) fn begin(&self, py: Python<'_>) -> PyResult<Running> {
+        self.start(py, self.output.clone(), 0)
+    }
+
+    /// A child writes beside its parent rather than over it, and namespaces its
+    /// packet sequences by pid so the two traces can be concatenated.
+    fn begin_child(&self, py: Python<'_>) -> PyResult<Running> {
+        let pid = std::process::id();
+        self.start(py, format!("{}.{pid}", self.output), pid)
+    }
+
+    fn start(&self, py: Python<'_>, output: String, slot: u32) -> PyResult<Running> {
         let queue = Arc::new(EventQueue::new(Clock::starting_now()));
         let state = Arc::new(State {
             run: queue.id(),
@@ -38,7 +58,7 @@ impl Tracer {
 
         let sink = self
             .format
-            .open(&self.output)
+            .open(&output, slot)
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
         let exporter = {
@@ -51,10 +71,11 @@ impl Tracer {
                 .map_err(|e| PyRuntimeError::new_err(format!("spawn exporter: {e}")))?
         };
 
-        match monitoring::enable(py, state) {
+        match monitoring::enable(py, state.clone()) {
             Ok(monitoring) => Ok(Running {
                 queue,
-                monitoring,
+                state,
+                monitoring: Some(monitoring),
                 exporter,
             }),
             Err(e) => {
@@ -68,11 +89,15 @@ impl Tracer {
     pub(crate) fn end(py: Python<'_>, running: Running) -> PyResult<()> {
         let Running {
             queue,
+            state: _,
             monitoring,
             exporter,
         } = running;
 
-        let disabled = monitoring::disable(py, &monitoring);
+        let disabled = match &monitoring {
+            Some(h) => monitoring::disable(py, h),
+            None => Ok(()),
+        };
         queue.record_dropped(COLD.with_borrow_mut(|cold| cold.flush_partial(hot())));
         queue.close();
         let joined = py.detach(move || exporter.join());
@@ -84,6 +109,79 @@ impl Tracer {
             Err(_) => Err(PyRuntimeError::new_err("exporter thread panicked")),
         }
     }
+}
+
+/// Run `f` against the tracer that is currently tracing, if any. A fork hook
+/// fires for every fork in the process, including forks by programs that never
+/// started a tracer.
+fn with_active<T>(f: impl FnOnce(&Tracer) -> PyResult<T>) -> PyResult<Option<T>> {
+    let active = ACTIVE.lock();
+    match active.as_ref() {
+        Some(tracer) => f(tracer.get()).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Stop delivering callbacks before the address space is cloned, so that no
+/// callback can run in the child against state the child is about to abandon.
+#[pyfunction]
+pub fn _before_fork(py: Python<'_>) -> PyResult<()> {
+    with_active(|tracer| {
+        let mut slot = tracer.running.lock();
+        if let Some(running) = slot.as_mut()
+            && let Some(handle) = running.monitoring.take()
+        {
+            monitoring::disable(py, &handle)?;
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+#[pyfunction]
+pub fn _after_fork_in_parent(py: Python<'_>) -> PyResult<()> {
+    with_active(|tracer| {
+        let mut slot = tracer.running.lock();
+        if let Some(running) = slot.as_mut() {
+            running.monitoring = Some(monitoring::enable(py, running.state.clone())?);
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// Start the child's own trace. The inherited run is deliberately leaked: its
+/// exporter thread did not survive the fork, and any lock it held at that
+/// instant is still held by nobody, so reading or dropping that state could
+/// block forever.
+#[pyfunction]
+pub fn _after_fork_in_child(py: Python<'_>) -> PyResult<()> {
+    with_active(|tracer| {
+        let mut slot = tracer.running.lock();
+        std::mem::forget(slot.take());
+        *slot = Some(tracer.begin_child(py)?);
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// Registered once per process: `os.register_at_fork` stacks handlers, and a
+/// child inherits the ones its parent registered.
+fn register_fork_hooks(py: Python<'_>) -> PyResult<()> {
+    let mut result = Ok(());
+    HOOKS_REGISTERED.call_once(|| {
+        result = (|| {
+            let module = py.import("trace0._core")?;
+            let kwargs = pyo3::types::PyDict::new(py);
+            kwargs.set_item("before", module.getattr("_before_fork")?)?;
+            kwargs.set_item("after_in_parent", module.getattr("_after_fork_in_parent")?)?;
+            kwargs.set_item("after_in_child", module.getattr("_after_fork_in_child")?)?;
+            py.import("os")?
+                .call_method("register_at_fork", (), Some(&kwargs))?;
+            Ok(())
+        })();
+    });
+    result
 }
 
 #[pymethods]
@@ -98,22 +196,25 @@ impl Tracer {
         })
     }
 
-    fn __enter__<'py>(slf: PyRef<'py, Self>, py: Python<'py>) -> PyResult<PyRef<'py, Self>> {
-        let running = slf.begin(py)?;
-        let mut slot = slf.running.lock();
+    pub(crate) fn __enter__<'py>(slf: &Bound<'py, Self>, py: Python<'py>) -> PyResult<Bound<'py, Self>> {
+        register_fork_hooks(py)?;
+        let running = slf.get().begin(py)?;
+        let mut slot = slf.get().running.lock();
         debug_assert!(slot.is_none(), "__enter__ replaced a run still going");
         *slot = Some(running);
         drop(slot);
-        Ok(slf)
+        *ACTIVE.lock() = Some(slf.clone().unbind());
+        Ok(slf.clone())
     }
 
-    fn __exit__(
+    pub(crate) fn __exit__(
         &self,
         py: Python<'_>,
         _exc_type: Option<Bound<'_, PyType>>,
         _exc_val: Option<Bound<'_, pyo3::types::PyAny>>,
         _exc_tb: Option<Bound<'_, pyo3::types::PyAny>>,
     ) -> PyResult<bool> {
+        *ACTIVE.lock() = None;
         match self.running.lock().take() {
             Some(running) => Tracer::end(py, running)?,
             None => return Err(PyRuntimeError::new_err("tracer is not tracing")),

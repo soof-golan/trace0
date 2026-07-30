@@ -39,6 +39,13 @@ struct Sequence {
     name_iids: ahash::AHashMap<u32, u64>,
 }
 
+/// Sequence ids must not collide between processes merged into one trace,
+/// because Perfetto scopes interned names to them and will interleave two
+/// processes that ran at the same time. A slot of 0 belongs to the process
+/// the user launched, whose ids stay one varint byte wide; a child passes its
+/// pid, which is unique among live processes and costs it a wider id.
+const SEQUENCES_PER_SLOT: u32 = 128;
+
 pub struct ProtoExporter<W: Write + Send> {
     out: W,
     scratch: Vec<u8>,
@@ -49,6 +56,7 @@ pub struct ProtoExporter<W: Write + Send> {
     process_emitted: bool,
     pid: i32,
     process_uuid: u64,
+    slot: u32,
 }
 
 /// Track uuids must not collide between processes whose traces are merged
@@ -76,12 +84,18 @@ impl<W: Write + Send> ProtoExporter<W> {
             process_emitted: false,
             pid: std::process::id() as i32,
             process_uuid: process_uuid_of(std::process::id() as i32),
+            slot: 0,
         }
     }
 
     pub fn with_pid(mut self, pid: i32) -> Self {
         self.pid = pid;
         self.process_uuid = process_uuid_of(pid);
+        self
+    }
+
+    pub fn with_slot(mut self, slot: u32) -> Self {
+        self.slot = slot;
         self
     }
 
@@ -194,7 +208,7 @@ impl<W: Write + Send> ProtoExporter<W> {
         let pid = self.pid;
         let pkt = pb::TracePacket {
             timestamp: Some(0),
-            trusted_packet_sequence_id: Some(PROCESS_SEQUENCE_ID),
+            trusted_packet_sequence_id: Some(self.process_sequence_id()),
             sequence_flags: Some(SEQ_INCREMENTAL_STATE_CLEARED),
             trace_packet_defaults: None,
             interned_data: None,
@@ -213,12 +227,20 @@ impl<W: Write + Send> ProtoExporter<W> {
         self.write_packet(&pkt)
     }
 
+    fn process_sequence_id(&self) -> u32 {
+        self.slot * SEQUENCES_PER_SLOT + PROCESS_SEQUENCE_ID
+    }
+
     fn ensure_sequence(&mut self, tid: u32, threads: &dyn ThreadNames) -> io::Result<()> {
         if self.sequences.contains_key(&tid) {
             return Ok(());
         }
         let index = self.sequences.len() as u64;
-        let id = PROCESS_SEQUENCE_ID + 1 + index as u32;
+        debug_assert!(
+            index as u32 + PROCESS_SEQUENCE_ID < SEQUENCES_PER_SLOT,
+            "more threads than a slot has sequence ids"
+        );
+        let id = self.slot * SEQUENCES_PER_SLOT + PROCESS_SEQUENCE_ID + 1 + index as u32;
         let track_uuid = self.process_uuid + 1 + index;
 
         let mut header = Vec::with_capacity(4);
@@ -325,7 +347,7 @@ impl<W: Write + Send> Exporter for ProtoExporter<W> {
             self.ensure_process()?;
             let pkt = pb::TracePacket {
                 timestamp: Some(0),
-                trusted_packet_sequence_id: Some(PROCESS_SEQUENCE_ID),
+                trusted_packet_sequence_id: Some(self.process_sequence_id()),
                 interned_data: None,
                 sequence_flags: None,
                 trace_packet_defaults: None,
@@ -796,6 +818,34 @@ mod tests {
             assigned,
             vec![(30, base + 1), (10, base + 2), (20, base + 3)]
         );
+    }
+
+    #[test]
+    fn a_child_slot_keeps_its_sequences_clear_of_the_root() {
+        let events = [
+            Event::new(0, 10, 0, EventKind::Begin),
+            Event::new(1, 20, 0, EventKind::Begin),
+        ];
+        let sequences = |slot: u32| -> std::collections::HashSet<u32> {
+            let mut buf = Vec::new();
+            {
+                let mut ex = ProtoExporter::new(&mut buf).with_pid(7).with_slot(slot);
+                ex.write_batch(&events, &fib_table(), &ThreadTable::new())
+                    .unwrap();
+                ex.finish(&fib_table(), &ThreadTable::new(), 0).unwrap();
+            }
+            packets(&buf)
+                .iter()
+                .filter_map(|p| p.trusted_packet_sequence_id)
+                .collect()
+        };
+        let root = sequences(0);
+        assert!(
+            root.iter().all(|&s| s < 128),
+            "the root process must keep one-byte sequence ids: {root:?}"
+        );
+        assert!(root.is_disjoint(&sequences(4242)));
+        assert!(sequences(4242).is_disjoint(&sequences(4243)));
     }
 
     #[test]
