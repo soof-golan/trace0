@@ -1,0 +1,1 @@
+import os, sys; os.environ.get("TRACE0_CHILD_OUTPUT") and __import__("trace0").process_startup()

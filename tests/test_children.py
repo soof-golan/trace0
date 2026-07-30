@@ -138,6 +138,73 @@ print(hung)
     assert stdout.strip() == "0", f"{stdout.strip()} forked children hung"
 
 
+def test_a_spawned_child_writes_its_own_trace(tmp_path: Path):
+    """A process reached by exec shares no memory with its parent, so it is
+    picked up by the `.pth` at interpreter startup rather than a fork hook."""
+    out = tmp_path / "t.json"
+    run_script(
+        tmp_path,
+        """
+import subprocess, sys
+subprocess.run(
+    [sys.executable, "-c", "def spawned_work():\\n    return sum(range(300))\\nspawned_work()\\n"],
+    check=True,
+)
+def parent_work():
+    return sum(range(100))
+parent_work()
+""",
+        out,
+    )
+    children = child_traces(out)
+    assert len(children) == 1, f"expected one child trace, got {children}"
+    assert "spawned_work" in names(children[0])
+    assert "parent_work" in names(out)
+
+
+def test_multiprocessing_workers_are_traced(tmp_path: Path):
+    """`Pool` as a context manager terminates its workers, and a worker killed
+    by a signal never runs the atexit that finishes its trace. Shut the pool
+    down gracefully so the workers get to write theirs.
+    """
+    out = tmp_path / "t.json"
+    run_script(
+        tmp_path,
+        """
+import multiprocessing as mp
+
+def worker_body(n):
+    return sum(i * i for i in range(n))
+
+if __name__ == "__main__":
+    ctx = mp.get_context("spawn")
+    pool = ctx.Pool(2)
+    pool.map(worker_body, [200, 300])
+    pool.close()
+    pool.join()
+""",
+        out,
+    )
+    children = child_traces(out)
+    assert children, "no worker was traced"
+    assert any("worker_body" in names(t) for t in children)
+
+
+def test_nothing_is_traced_once_the_run_is_over(tmp_path: Path):
+    """The environment variable the `.pth` keys on must not outlive the run,
+    or every later subprocess would write a stray trace."""
+    out = tmp_path / "t.json"
+    run_script(tmp_path, "pass\n", out)
+
+    leaked = subprocess.run(
+        [sys.executable, "-c", "import os; print(os.environ.get('TRACE0_CHILD_OUTPUT'))"],
+        capture_output=True,
+        text=True,
+    )
+    assert leaked.stdout.strip() == "None"
+    assert not child_traces(out)
+
+
 @FORK_ONLY
 def test_a_child_that_forks_again_still_traces(tmp_path: Path):
     out = tmp_path / "t.json"

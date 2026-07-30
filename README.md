@@ -98,6 +98,28 @@ Output is Perfetto protobuf by default. `--format json`, or
 `Tracer(..., format="json")`, writes Chrome Trace Event instead — larger and
 slower to write, but human-readable and diffable.
 
+## Child processes
+
+Children are traced too, whether they arrive by `fork` or by `exec`, so
+`multiprocessing`, `subprocess` and worker-based servers all show up. Each
+process writes beside the one that launched it:
+
+```
+trace.pb        the process you ran
+trace.pb.5421   a child
+trace.pb.5422   another
+```
+
+Concatenating them gives Perfetto one trace with a track per process:
+
+```bash
+cat trace.pb trace.pb.* > merged.pb
+```
+
+A child killed by a signal never finishes its file. `Pool` used as a context
+manager terminates its workers, so close and join it instead when you want
+their traces.
+
 ## Status
 
 Early. The tracer works end to end and is covered by tests, but the API is not

@@ -22,6 +22,7 @@ trace0 = "trace0.__main__:main"
 manifest-path = "crates/py/Cargo.toml"
 module-name = "trace0._core"
 python-source = "python"
+data = "wheel_data"
 
 [tool.uv]
 cache-keys = [

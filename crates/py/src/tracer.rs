@@ -111,6 +111,27 @@ impl Tracer {
     }
 }
 
+const CHILD_OUTPUT: &str = "TRACE0_CHILD_OUTPUT";
+const CHILD_FORMAT: &str = "TRACE0_CHILD_FORMAT";
+
+/// A process started by exec shares no memory with its parent, so the only
+/// thing that reaches it is the environment. The `.pth` shipped with the
+/// package reads these on interpreter startup.
+fn advertise_to_spawned_children(py: Python<'_>, output: &str, format: Format) -> PyResult<()> {
+    let environ = py.import("os")?.getattr("environ")?;
+    environ.set_item(CHILD_OUTPUT, output)?;
+    environ.set_item(CHILD_FORMAT, format.as_str())?;
+    Ok(())
+}
+
+fn stop_advertising(py: Python<'_>) -> PyResult<()> {
+    let environ = py.import("os")?.getattr("environ")?;
+    for key in [CHILD_OUTPUT, CHILD_FORMAT] {
+        environ.call_method1("pop", (key, py.None()))?;
+    }
+    Ok(())
+}
+
 /// Run `f` against the tracer that is currently tracing, if any. A fork hook
 /// fires for every fork in the process, including forks by programs that never
 /// started a tracer.
@@ -165,6 +186,22 @@ pub fn _after_fork_in_child(py: Python<'_>) -> PyResult<()> {
     Ok(())
 }
 
+impl Tracer {
+    fn install<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        running: Running,
+    ) -> PyResult<Bound<'py, Self>> {
+        register_fork_hooks(py)?;
+        let mut slot = slf.get().running.lock();
+        debug_assert!(slot.is_none(), "entered a run that was still going");
+        *slot = Some(running);
+        drop(slot);
+        *ACTIVE.lock() = Some(slf.clone().unbind());
+        Ok(slf.clone())
+    }
+}
+
 /// Registered once per process: `os.register_at_fork` stacks handlers, and a
 /// child inherits the ones its parent registered.
 fn register_fork_hooks(py: Python<'_>) -> PyResult<()> {
@@ -196,15 +233,23 @@ impl Tracer {
         })
     }
 
-    pub(crate) fn __enter__<'py>(slf: &Bound<'py, Self>, py: Python<'py>) -> PyResult<Bound<'py, Self>> {
-        register_fork_hooks(py)?;
-        let running = slf.get().begin(py)?;
-        let mut slot = slf.get().running.lock();
-        debug_assert!(slot.is_none(), "__enter__ replaced a run still going");
-        *slot = Some(running);
-        drop(slot);
-        *ACTIVE.lock() = Some(slf.clone().unbind());
-        Ok(slf.clone())
+    pub(crate) fn __enter__<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, Self>> {
+        let me = slf.get();
+        advertise_to_spawned_children(py, &me.output, me.format)?;
+        Self::install(slf, py, me.begin(py)?)
+    }
+
+    /// Enter as a process that exec'd out of a traced one: same bookkeeping,
+    /// but writing beside the trace its parent named rather than over it.
+    fn _enter_as_child<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, Self>> {
+        let running = slf.get().begin_child(py)?;
+        Self::install(slf, py, running)
     }
 
     pub(crate) fn __exit__(
@@ -215,6 +260,7 @@ impl Tracer {
         _exc_tb: Option<Bound<'_, pyo3::types::PyAny>>,
     ) -> PyResult<bool> {
         *ACTIVE.lock() = None;
+        stop_advertising(py)?;
         match self.running.lock().take() {
             Some(running) => Tracer::end(py, running)?,
             None => return Err(PyRuntimeError::new_err("tracer is not tracing")),
