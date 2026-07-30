@@ -77,9 +77,11 @@ impl<W: Write + Send> ProtoExporter<W> {
         packet
             .encode(&mut self.scratch)
             .map_err(|e| io::Error::other(e.to_string()))?;
-        let mut header = [0u8; 11];
+        let body_len = Varint::of(self.scratch.len() as u64);
+        let mut header = [0u8; 1 + Varint::MAX];
         header[0] = PACKET_TAG;
-        let n = 1 + put_varint(&mut header[1..], self.scratch.len() as u64);
+        let n = 1 + body_len.as_slice().len();
+        header[1..n].copy_from_slice(body_len.as_slice());
         self.out.write_all(&header[..n])?;
         self.out.write_all(&self.scratch)
     }
@@ -133,18 +135,19 @@ impl<W: Write + Send> ProtoExporter<W> {
             pb::track_event::Type::SliceEnd as u8
         });
         event.push(tag::TRACK_UUID);
-        push_varint(&mut event, uuid);
+        event.extend_from_slice(Varint::of(uuid).as_slice());
         if opens {
             let name_iid = self.name_iid(code_id, codes)?;
             event.push(tag::CATEGORY_IIDS);
-            push_varint(&mut event, CATEGORY_IID);
+            event.extend_from_slice(Varint::of(CATEGORY_IID).as_slice());
             event.push(tag::NAME_IID);
-            push_varint(&mut event, name_iid);
+            event.extend_from_slice(Varint::of(name_iid).as_slice());
         }
 
         let start = self.template_bytes.len() as u32;
         self.template_bytes.push(tag::TRACK_EVENT);
-        push_varint(&mut self.template_bytes, event.len() as u64);
+        self.template_bytes
+            .extend_from_slice(Varint::of(event.len() as u64).as_slice());
         self.template_bytes.extend_from_slice(&event);
         let range = (start, self.template_bytes.len() as u32 - start);
 
@@ -153,15 +156,16 @@ impl<W: Write + Send> ProtoExporter<W> {
     }
 
     fn push_event(&mut self, ts_ns: u64, template: (u32, u32)) {
-        let mut ts = [0u8; 10];
-        let ts_len = put_varint(&mut ts, ts_ns);
+        let ts = Varint::of(ts_ns);
         let (start, len) = template;
 
-        let body_len = 1 + ts_len + SEQUENCE_FIELD.len() + NEEDS_STATE_FIELD.len() + len as usize;
+        let body_len =
+            1 + ts.as_slice().len() + SEQUENCE_FIELD.len() + NEEDS_STATE_FIELD.len() + len as usize;
         self.buf.push(PACKET_TAG);
-        push_varint(&mut self.buf, body_len as u64);
+        self.buf
+            .extend_from_slice(Varint::of(body_len as u64).as_slice());
         self.buf.push(tag::TIMESTAMP);
-        self.buf.extend_from_slice(&ts[..ts_len]);
+        self.buf.extend_from_slice(ts.as_slice());
         self.buf.extend_from_slice(&SEQUENCE_FIELD);
         self.buf.extend_from_slice(&NEEDS_STATE_FIELD);
         let (a, b) = (start as usize, (start + len) as usize);
@@ -233,25 +237,32 @@ impl<W: Write + Send> ProtoExporter<W> {
     }
 }
 
-fn push_varint(out: &mut Vec<u8>, mut v: u64) {
-    while v >= 0x80 {
-        out.push((v as u8) | 0x80);
-        v >>= 7;
-    }
-    out.push(v as u8);
+#[derive(Clone, Copy)]
+struct Varint {
+    bytes: [u8; Varint::MAX],
+    len: usize,
 }
 
-fn put_varint(buf: &mut [u8], mut v: u64) -> usize {
-    let mut n = 0;
-    loop {
-        let byte = (v & 0x7f) as u8;
-        v >>= 7;
-        if v == 0 {
-            buf[n] = byte;
-            return n + 1;
+impl Varint {
+    const MAX: usize = 10;
+
+    fn of(mut v: u64) -> Self {
+        let mut bytes = [0u8; Self::MAX];
+        let mut len = 0;
+        while v >= 0x80 {
+            bytes[len] = (v as u8) | 0x80;
+            v >>= 7;
+            len += 1;
         }
-        buf[n] = byte | 0x80;
-        n += 1;
+        bytes[len] = v as u8;
+        Self {
+            bytes,
+            len: len + 1,
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
     }
 }
 
@@ -586,6 +597,24 @@ mod tests {
             named,
             vec![(1, "MainThread".to_string()), (2, "cpu-a".to_string())]
         );
+    }
+
+    #[test]
+    fn a_varint_round_trips_at_every_width() {
+        for v in [0u64, 1, 127, 128, 16_383, 16_384, u32::MAX as u64, u64::MAX] {
+            let encoded = Varint::of(v);
+            let (decoded, used) = get_varint(encoded.as_slice());
+            assert_eq!(decoded, v);
+            assert_eq!(used, encoded.as_slice().len(), "trailing bytes for {v}");
+        }
+    }
+
+    #[test]
+    fn a_varint_is_never_wider_than_the_value_needs() {
+        assert_eq!(Varint::of(0).as_slice().len(), 1);
+        assert_eq!(Varint::of(127).as_slice().len(), 1);
+        assert_eq!(Varint::of(128).as_slice().len(), 2);
+        assert_eq!(Varint::of(u64::MAX).as_slice().len(), Varint::MAX);
     }
 
     #[test]
