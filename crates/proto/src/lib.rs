@@ -513,6 +513,51 @@ mod tests {
     }
 
     #[test]
+    fn interleaved_threads_and_names_never_borrow_each_others_track() {
+        let mut codes = CodeTable::new();
+        for n in ["a", "b", "c"] {
+            codes.push_named(n);
+        }
+        let mut threads = ThreadTable::new();
+        for tid in 1..=3u32 {
+            threads.insert(tid, &format!("t{tid}"));
+        }
+        let events: Vec<Event> = (0..60)
+            .map(|i| {
+                let tid = 1 + (i % 3) as u32;
+                let code = (i * 7 % 3) as u32;
+                let kind = if i % 2 == 0 {
+                    EventKind::Begin
+                } else {
+                    EventKind::End
+                };
+                Event::new(i as u64 * 100, tid, code, kind)
+            })
+            .collect();
+
+        let raw = export(&events, &codes, &threads, 0);
+        let pkts = packets(&raw);
+        let uuid_of: std::collections::HashMap<u32, u64> = descriptors(&pkts)
+            .iter()
+            .filter_map(|d| d.thread.as_ref().map(|t| (t.tid() as u32, d.uuid())))
+            .collect();
+
+        let tes = track_events(&pkts);
+        assert_eq!(tes.len(), events.len());
+        for (ev, te) in events.iter().zip(&tes) {
+            assert_eq!(
+                te.track_uuid(),
+                uuid_of[&ev.tid],
+                "an event landed on another thread's track"
+            );
+            if ev.kind().opens_slice() {
+                let want = ["a", "b", "c"][ev.code_id() as usize];
+                assert_eq!(event_name(&pkts, te), want, "a memo served a stale name");
+            }
+        }
+    }
+
+    #[test]
     fn hand_framing_round_trips_through_a_decoder() {
         let raw = export(
             &[Event::new(1_000, 7, 0, EventKind::Begin)],
