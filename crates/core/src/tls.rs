@@ -89,8 +89,19 @@ impl Cold {
             return;
         };
         let start = batch.events.as_mut_ptr();
-        // SAFETY: `cursor` always addresses this batch's buffer, between
-        // `start` and `start + BATCH_N`.
+        // SAFETY: `cursor` addresses this batch's buffer, between `start`
+        // and one past its last slot. Every assignment to `self.batch` is
+        // followed by [`Cold::arm`], which repoints both `cursor` and
+        // `end`, and the push path advances `cursor` only while it is
+        // below `end`.
+        debug_assert!(
+            hot.end == unsafe { start.add(batch.events.capacity()) },
+            "commit: hot is armed for a different batch than this one"
+        );
+        debug_assert!(
+            hot.cursor >= start && hot.cursor <= hot.end,
+            "commit: cursor has left the batch it is measured against"
+        );
         let len = unsafe { hot.cursor.offset_from(start) } as usize;
         unsafe { batch.events.set_len(len) };
     }
@@ -196,4 +207,104 @@ pub fn hot() -> &'static mut Hot {
 pub fn codes() -> &'static mut CodeCache {
     let ptr = CODES.with(|cell| cell.get());
     unsafe { &mut *ptr }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`Hot`] and [`Cold`] are thread-locals, and `Cold::drop` reads the
+    /// `Hot` slot as it tears down, so each case needs a thread of its
+    /// own. Panics are re-raised with their original payload so
+    /// `should_panic` can match on the message.
+    fn on_a_fresh_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        match std::thread::spawn(f).join() {
+            Ok(v) => v,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    fn armed(hot: &mut Hot) -> Cold {
+        let mut cold = Cold {
+            producer: None,
+            batch: Some(Box::new(EventBatch::with_capacity(BATCH_N, 0, 1))),
+        };
+        cold.arm(hot);
+        cold
+    }
+
+    /// Walk the cursor the way the push path does: straight through it,
+    /// with nothing else updated.
+    fn walk(hot: &mut Hot, n: usize) {
+        for i in 0..n {
+            unsafe {
+                hot.cursor.write(PackedEvent {
+                    delta_ticks: i as u32,
+                    code_kind: 0,
+                });
+                hot.cursor = hot.cursor.add(1);
+            }
+        }
+    }
+
+    #[test]
+    fn commit_publishes_the_events_the_cursor_walked_past() {
+        let events = on_a_fresh_thread(|| {
+            let hot = hot();
+            let mut cold = armed(hot);
+            walk(hot, 3);
+            cold.commit(hot);
+            cold.batch.as_ref().unwrap().events.clone()
+        });
+        let deltas: Vec<u32> = events.iter().map(|e| e.delta_ticks).collect();
+        assert_eq!(deltas, [0, 1, 2]);
+    }
+
+    /// A batch filled to the last slot leaves `cursor == end`, one past
+    /// the final event. That is in range, and all of it is committed.
+    #[test]
+    fn a_full_batch_commits_every_slot() {
+        let len = on_a_fresh_thread(|| {
+            let hot = hot();
+            let mut cold = armed(hot);
+            walk(hot, BATCH_N);
+            assert_eq!(hot.cursor, hot.end);
+            cold.commit(hot);
+            cold.batch.as_ref().unwrap().events.len()
+        });
+        assert_eq!(len, BATCH_N);
+    }
+
+    /// One slot further is out of range, and committing it would publish
+    /// a length past the end of the allocation.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "left the batch")]
+    fn a_cursor_past_the_end_of_the_batch_is_caught() {
+        on_a_fresh_thread(|| {
+            let hot = hot();
+            // Leaked rather than dropped: `Cold::drop` commits again, and
+            // a second panic during this one's unwind aborts the process.
+            let mut cold = std::mem::ManuallyDrop::new(armed(hot));
+            walk(hot, BATCH_N);
+            hot.cursor = hot.cursor.wrapping_add(1);
+            cold.commit(hot);
+        });
+    }
+
+    /// Every assignment to `batch` in this module is paired with `arm`.
+    /// Unpaired, the length would be measured from an allocation the
+    /// cursor never walked.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "different batch")]
+    fn committing_against_a_batch_the_cursor_never_walked_is_caught() {
+        on_a_fresh_thread(|| {
+            let hot = hot();
+            let mut cold = std::mem::ManuallyDrop::new(armed(hot));
+            walk(hot, 3);
+            cold.batch = Some(Box::new(EventBatch::with_capacity(BATCH_N, 0, 1)));
+            cold.commit(hot);
+        });
+    }
 }
