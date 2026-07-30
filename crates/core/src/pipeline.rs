@@ -6,8 +6,30 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-const FANIN_CAPACITY: usize = 1 << 22;
+const FANIN_BATCHES: usize = 256;
 const BATCH: usize = 4096;
+const IDLE_MIN: Duration = Duration::from_micros(20);
+const IDLE_MAX: Duration = Duration::from_micros(200);
+
+fn backoff(idle: &mut Duration) {
+    thread::sleep(*idle);
+    *idle = (*idle * 2).min(IDLE_MAX);
+}
+
+fn ship(
+    full: &mut rtrb::Producer<Vec<Event>>,
+    spent: &mut rtrb::Consumer<Vec<Event>>,
+    batch: Vec<Event>,
+    dropped: &mut u64,
+) -> Vec<Event> {
+    match full.push(batch) {
+        Ok(()) => spent.pop().unwrap_or_else(|_| Vec::with_capacity(BATCH)),
+        Err(rtrb::PushError::Full(lost)) => {
+            *dropped += lost.len() as u64;
+            lost
+        }
+    }
+}
 
 pub fn run_pipeline(
     inbound: Arc<EventQueue>,
@@ -15,7 +37,8 @@ pub fn run_pipeline(
     threads: Arc<dyn ThreadNames>,
     mut exporter: Box<dyn Exporter>,
 ) -> io::Result<()> {
-    let (mut fanin_tx, mut fanin_rx) = rtrb::RingBuffer::<Event>::new(FANIN_CAPACITY);
+    let (mut full_tx, mut full_rx) = rtrb::RingBuffer::<Vec<Event>>::new(FANIN_BATCHES);
+    let (mut spent_tx, mut spent_rx) = rtrb::RingBuffer::<Vec<Event>>::new(FANIN_BATCHES);
 
     let serializer = {
         let inbound = inbound.clone();
@@ -23,70 +46,50 @@ pub fn run_pipeline(
             .name("trace0-serializer".into())
             .spawn(move || {
                 let mut dropped: u64 = 0;
-                let mut buf: Vec<Event> = Vec::with_capacity(BATCH);
-                let mut empty_spins: u32 = 0;
-                const SPIN_BEFORE_YIELD: u32 = 1024;
+                let mut idle = IDLE_MIN;
+                let mut batch: Vec<Event> = Vec::with_capacity(BATCH);
                 loop {
-                    let n = inbound.drain_nonblocking(&mut buf, BATCH);
-                    if n == 0 {
-                        empty_spins += 1;
-                        if empty_spins >= SPIN_BEFORE_YIELD {
-                            if inbound.is_closed() {
-                                break;
-                            }
-                            thread::yield_now();
-                            empty_spins = 0;
-                        } else {
-                            std::hint::spin_loop();
+                    batch.clear();
+                    if inbound.drain_nonblocking(&mut batch, BATCH) == 0 {
+                        if inbound.is_closed() {
+                            break;
                         }
+                        backoff(&mut idle);
                         continue;
                     }
-                    empty_spins = 0;
-                    for ev in buf.drain(..) {
-                        if fanin_tx.push(ev).is_err() {
-                            dropped += 1;
-                        }
-                    }
+                    idle = IDLE_MIN;
+                    batch = ship(&mut full_tx, &mut spent_rx, batch, &mut dropped);
                 }
                 loop {
-                    let n = inbound.drain_nonblocking(&mut buf, BATCH);
-                    if n == 0 {
+                    batch.clear();
+                    if inbound.drain_nonblocking(&mut batch, BATCH) == 0 {
                         break;
                     }
-                    for ev in buf.drain(..) {
-                        if fanin_tx.push(ev).is_err() {
-                            dropped += 1;
-                        }
-                    }
+                    batch = ship(&mut full_tx, &mut spent_rx, batch, &mut dropped);
                 }
                 dropped
             })
             .map_err(io::Error::other)?
     };
 
-    let mut buf: Vec<Event> = Vec::with_capacity(BATCH);
+    let mut idle = IDLE_MIN;
     loop {
-        while let Ok(ev) = fanin_rx.pop() {
-            buf.push(ev);
-            if buf.len() >= BATCH {
-                break;
+        match full_rx.pop() {
+            Ok(batch) => {
+                idle = IDLE_MIN;
+                exporter.write_batch(&batch, codes.as_ref(), threads.as_ref())?;
+                let _ = spent_tx.push(batch);
+            }
+            Err(_) => {
+                if serializer.is_finished() {
+                    while let Ok(batch) = full_rx.pop() {
+                        exporter.write_batch(&batch, codes.as_ref(), threads.as_ref())?;
+                    }
+                    break;
+                }
+                backoff(&mut idle);
             }
         }
-        if !buf.is_empty() {
-            exporter.write_batch(&buf, codes.as_ref(), threads.as_ref())?;
-            buf.clear();
-            continue;
-        }
-        if serializer.is_finished() {
-            while let Ok(ev) = fanin_rx.pop() {
-                buf.push(ev);
-            }
-            if !buf.is_empty() {
-                exporter.write_batch(&buf, codes.as_ref(), threads.as_ref())?;
-            }
-            break;
-        }
-        thread::sleep(Duration::from_millis(5));
     }
 
     let fanin_dropped = serializer
