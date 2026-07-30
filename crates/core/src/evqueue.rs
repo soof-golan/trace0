@@ -28,15 +28,25 @@ impl EventBatch {
     }
 }
 
-pub struct EventQueue {
-    id: u64,
-    clock: Clock,
+const CACHE_LINE: usize = 64;
+
+#[repr(align(64))]
+struct Shared {
     consumers: Mutex<Vec<Consumer<Box<EventBatch>>>>,
     dropped: AtomicU64,
     closed: AtomicBool,
     wake_lock: Mutex<()>,
     wake_cv: Condvar,
 }
+
+pub struct EventQueue {
+    id: u64,
+    clock: Clock,
+    shared: Shared,
+}
+
+const _: () = assert!(std::mem::offset_of!(EventQueue, shared) % CACHE_LINE == 0);
+const _: () = assert!(std::mem::size_of::<Shared>().is_multiple_of(CACHE_LINE));
 
 static NEXT_QUEUE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -45,11 +55,13 @@ impl EventQueue {
         Self {
             id: NEXT_QUEUE_ID.fetch_add(1, Ordering::Relaxed),
             clock,
-            consumers: Mutex::new(Vec::new()),
-            dropped: AtomicU64::new(0),
-            closed: AtomicBool::new(false),
-            wake_lock: Mutex::new(()),
-            wake_cv: Condvar::new(),
+            shared: Shared {
+                consumers: Mutex::new(Vec::new()),
+                dropped: AtomicU64::new(0),
+                closed: AtomicBool::new(false),
+                wake_lock: Mutex::new(()),
+                wake_cv: Condvar::new(),
+            },
         }
     }
 
@@ -91,7 +103,7 @@ impl EventQueue {
     #[inline(never)]
     fn init_producer(&self, cold: &mut Cold, hot: &mut Hot, ticks: u64, tid: u32) {
         let (prod, cons) = RingBuffer::<Box<EventBatch>>::new(BATCHES_CAPACITY);
-        self.consumers.lock().push(cons);
+        self.shared.consumers.lock().push(cons);
         cold.producer = Some((self.id, prod));
         cold.batch = Some(Box::new(EventBatch::with_capacity(BATCH_N, ticks, tid)));
         hot.queue_id = self.id;
@@ -130,7 +142,9 @@ impl EventQueue {
         let (_, prod) = cold.producer.as_mut().unwrap();
         let dropped = full.events.len();
         if let Err(rtrb::PushError::Full(returned)) = prod.push(full) {
-            self.dropped.fetch_add(dropped as u64, Ordering::Relaxed);
+            self.shared
+                .dropped
+                .fetch_add(dropped as u64, Ordering::Relaxed);
             let mut reused = returned;
             reused.events.clear();
             reused.base_ticks = base_ticks;
@@ -157,7 +171,7 @@ impl EventQueue {
     }
 
     pub fn drain_nonblocking(&self, out: &mut Vec<Event>, limit: usize) -> usize {
-        let mut consumers = self.consumers.lock();
+        let mut consumers = self.shared.consumers.lock();
         let mut got = 0;
         for c in consumers.iter_mut() {
             while let Ok(batch) = c.pop() {
@@ -172,14 +186,14 @@ impl EventQueue {
     }
 
     pub fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::Acquire)
+        self.shared.closed.load(Ordering::Acquire)
     }
 
     pub fn drain_blocking(&self, out: &mut Vec<Event>) -> bool {
         loop {
             let mut got = 0;
             {
-                let mut consumers = self.consumers.lock();
+                let mut consumers = self.shared.consumers.lock();
                 'outer: for c in consumers.iter_mut() {
                     while let Ok(batch) = c.pop() {
                         got += batch.events.len();
@@ -193,8 +207,8 @@ impl EventQueue {
             if got > 0 {
                 return true;
             }
-            if self.closed.load(Ordering::Acquire) {
-                let mut consumers = self.consumers.lock();
+            if self.shared.closed.load(Ordering::Acquire) {
+                let mut consumers = self.shared.consumers.lock();
                 for c in consumers.iter_mut() {
                     while let Ok(batch) = c.pop() {
                         self.decode_into(&batch, out);
@@ -202,23 +216,25 @@ impl EventQueue {
                 }
                 return !out.is_empty();
             }
-            let mut g = self.wake_lock.lock();
-            self.wake_cv.wait_for(&mut g, Duration::from_millis(20));
+            let mut g = self.shared.wake_lock.lock();
+            self.shared
+                .wake_cv
+                .wait_for(&mut g, Duration::from_millis(20));
         }
     }
 
     pub fn dropped(&self) -> u64 {
-        self.dropped.load(Ordering::Relaxed)
+        self.shared.dropped.load(Ordering::Relaxed)
     }
 
     pub fn record_dropped(&self, events: u64) {
-        self.dropped.fetch_add(events, Ordering::Relaxed);
+        self.shared.dropped.fetch_add(events, Ordering::Relaxed);
     }
 
     pub fn close(&self) {
-        self.closed.store(true, Ordering::Release);
-        let _g = self.wake_lock.lock();
-        self.wake_cv.notify_all();
+        self.shared.closed.store(true, Ordering::Release);
+        let _g = self.shared.wake_lock.lock();
+        self.shared.wake_cv.notify_all();
     }
 }
 
