@@ -3,7 +3,6 @@ use trace0_core::Exporter;
 use trace0_json::JsonExporter;
 use trace0_proto::ProtoExporter;
 
-/// Trace output formats, each backed by its own crate.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Format {
     Json,

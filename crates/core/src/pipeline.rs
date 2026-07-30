@@ -10,12 +10,6 @@ use std::time::Duration;
 const FANIN_CAPACITY: usize = 1 << 22;
 const BATCH: usize = 4096;
 
-/// Two-thread pipeline. A serializer drains the per-thread SPSC rings
-/// into a single fan-in buffer; a writer pops the fan-in buffer and runs
-/// the I/O-bound Exporter. Splitting separates the fast-drain step
-/// (memory-bandwidth-bound) from the slow-write step (encoding /
-/// disk-bound) so the per-thread rings can stay small without dropping
-/// during bursts.
 pub fn run_pipeline(
     inbound: Arc<EventQueue>,
     codes: Arc<dyn CodeLookup>,
@@ -58,7 +52,6 @@ pub fn run_pipeline(
                         }
                     }
                 }
-                // final drain after close
                 loop {
                     let n = inbound.drain_nonblocking(&mut buf, BATCH);
                     if n == 0 {

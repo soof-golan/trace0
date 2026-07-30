@@ -2,7 +2,6 @@ use crate::event::Event;
 use ahash::AHashMap;
 use std::io;
 
-/// What an exporter needs to know about a Python code object.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct CodeInfo {
     pub qualname: String,
@@ -10,22 +9,15 @@ pub struct CodeInfo {
     pub firstlineno: u32,
 }
 
-/// Resolves interned code ids back to source information.
-///
-/// The tracer's real implementation is backed by live Python code
-/// objects; [`CodeTable`] is the plain in-memory one used by tests and
-/// by anything replaying a trace.
 pub trait CodeLookup: Send + Sync {
     fn code(&self, id: u32) -> Option<CodeInfo>;
 }
 
-/// Resolves OS thread ids to thread names.
 pub trait ThreadNames: Send + Sync {
     fn name(&self, tid: u32) -> Option<String>;
     fn snapshot(&self) -> Vec<(u32, String)>;
 }
 
-/// Consumes decoded events and writes them out in some trace format.
 pub trait Exporter: Send {
     fn write_batch(
         &mut self,
@@ -34,8 +26,6 @@ pub trait Exporter: Send {
         threads: &dyn ThreadNames,
     ) -> io::Result<()>;
 
-    /// Flush and close out the file. `dropped` is the number of events
-    /// lost to queue overflow across the whole run.
     fn finish(
         &mut self,
         codes: &dyn CodeLookup,
@@ -44,7 +34,6 @@ pub trait Exporter: Send {
     ) -> io::Result<()>;
 }
 
-/// Straightforward id→[`CodeInfo`] storage.
 #[derive(Default)]
 pub struct CodeTable {
     info: Vec<CodeInfo>,
@@ -60,7 +49,6 @@ impl CodeTable {
         (self.info.len() - 1) as u32
     }
 
-    /// Convenience for callers that only care about the name.
     pub fn push_named(&mut self, qualname: &str) -> u32 {
         self.push(CodeInfo {
             qualname: qualname.to_string(),
@@ -83,7 +71,6 @@ impl CodeLookup for CodeTable {
     }
 }
 
-/// Straightforward tid→name storage.
 #[derive(Default)]
 pub struct ThreadTable {
     names: AHashMap<u32, String>,

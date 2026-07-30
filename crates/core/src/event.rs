@@ -25,7 +25,6 @@ impl EventKind {
         }
     }
 
-    /// Short tag used by the exporters' `args.kind` / debug output.
     pub fn as_str(self) -> &'static str {
         match self {
             EventKind::Begin => "start",
@@ -37,9 +36,6 @@ impl EventKind {
         }
     }
 
-    /// Whether this event opens a slice (as opposed to closing one).
-    /// `Throw` opens: it fires when a generator is resumed via
-    /// `.throw()`, which re-enters the frame just as `Resume` does.
     pub fn opens_slice(self) -> bool {
         matches!(
             self,
@@ -56,9 +52,6 @@ pub fn pack_code_kind(code_id: u32, kind: EventKind) -> u32 {
     ((kind as u32) << 24) | (code_id & CODE_ID_MASK)
 }
 
-/// 8-byte packed event living inside an `EventBatch`. `delta_ticks` is a
-/// raw-tick offset from the batch's `base_ticks`; `code_kind` carries the
-/// event kind in the top 8 bits and the interned code id in the low 24.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct PackedEvent {
@@ -68,10 +61,6 @@ pub struct PackedEvent {
 
 const _: () = assert!(std::mem::size_of::<PackedEvent>() == 8);
 
-/// 16-byte reconstructed event surfaced to the exporters, with the
-/// timestamp already converted to nanoseconds relative to the trace
-/// start. The hot path never builds one of these; batch decode produces
-/// them at drain time.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct Event {
@@ -79,6 +68,8 @@ pub struct Event {
     pub tid: u32,
     code_kind: u32,
 }
+
+const _: () = assert!(std::mem::size_of::<Event>() == 16);
 
 impl Event {
     #[inline]
@@ -163,7 +154,6 @@ mod tests {
             code_kind: pack_code_kind(7, EventKind::Begin),
         };
         let ev = Event::from_packed(&clock, 1_000, 42, p);
-        // Base 1000 is the anchor itself, so only the delta remains.
         assert_eq!(ev.ts_ns, 24);
         assert_eq!(ev.tid, 42);
         assert_eq!(ev.code_id(), 7);

@@ -14,11 +14,6 @@ impl ThreadRegistry {
         }
     }
 
-    /// Record this thread's name, if it has a usable one yet.
-    ///
-    /// Returns whether the tid is now known — callers use that to decide
-    /// whether to stop asking. A `false` here means "ask me again on the
-    /// next event", so the caller must not latch on it.
     pub fn ensure(&self, py: Python<'_>, tid: u32) -> bool {
         if self.inner.read().contains_key(&tid) {
             return true;
@@ -31,10 +26,6 @@ impl ThreadRegistry {
             .and_then(|n| n.extract::<String>())
             .unwrap_or_default();
 
-        // `current_thread()` returns a `_DummyThread` named `"Dummy-N"`
-        // when the calling thread isn't yet in `threading._active` — which
-        // happens for the first PY_START frames of every new `Thread`,
-        // before `_bootstrap_inner` registers it.
         if name.is_empty() || name.starts_with("Dummy-") {
             return false;
         }

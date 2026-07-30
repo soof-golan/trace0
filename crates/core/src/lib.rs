@@ -1,11 +1,3 @@
-//! Format-agnostic core of the tracer: the clock, the event model, the
-//! lock-free per-thread event queue, and the [`sink::Exporter`] contract
-//! the format crates implement.
-//!
-//! Nothing here depends on pyo3 or on Python, which is what makes the
-//! whole record → drain → export path testable against a synthetic
-//! [`clock::Clock`].
-
 pub mod clock;
 pub mod codecache;
 pub mod event;

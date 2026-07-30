@@ -1,31 +1,7 @@
-//! Per-thread cache from code-object address to interned code id.
-//!
-//! The single cached code object in `tls::Hot` covers a thread that stays
-//! inside one function, which recursion and tight loops both do. Anything
-//! that alternates between functions misses it on every event and falls
-//! through to the interner's `RwLock` -- uncontended in principle, but a
-//! shared cache line that every traced thread then writes to in turn.
-//!
-//! This sits between the two, and shares nothing.
-//!
-//! Caching an address is only sound because the interner holds a strong
-//! reference to every code object it has seen. An interned address is
-//! pinned for the tracer's lifetime and cannot be recycled under us.
-
-/// Entries per thread, 16 bytes each. Sized for a call-dense program's
-/// hot set rather than its total: sqlglot reaches 2,232 code objects but
-/// cycles through far fewer at any one moment.
 const SLOTS: usize = 256;
 
-/// Address zero marks a free slot. No code object lives there, and
-/// picking a marker of zero keeps the table in `.tbss`, so a thread that
-/// never records an event never faults the pages in.
 const EMPTY_KEY: usize = 0;
 
-/// Knuth's multiplicative constant. Code-object addresses are aligned and
-/// often consecutive, so the low bits are nearly constant and the high
-/// bits carry what little entropy there is -- multiply, then take from the
-/// top.
 const GOLDEN: usize = 0x9E37_79B9_7F4A_7C15;
 
 #[derive(Clone, Copy)]
@@ -36,13 +12,12 @@ struct Slot {
     _pad: u32,
 }
 
-/// A direct-mapped, per-thread address → code id table.
-///
-/// Collisions evict rather than probe. An evicted key costs one more trip
-/// to the interner, which is what every lookup cost before this existed.
 pub struct CodeCache {
     slots: [Slot; SLOTS],
 }
+
+const _: () = assert!(std::mem::size_of::<Slot>() == 16);
+const _: () = assert!(std::mem::size_of::<CodeCache>() == 4096);
 
 impl CodeCache {
     pub const EMPTY: Self = CodeCache {
@@ -80,7 +55,6 @@ impl CodeCache {
 mod tests {
     use super::*;
 
-    /// Two keys chosen to land in the same slot, for the eviction tests.
     fn colliding_pair() -> (usize, usize) {
         let first = 0x1000_usize;
         let slot = CodeCache::slot_of(first);
@@ -89,6 +63,21 @@ mod tests {
             .find(|&k| k != first && CodeCache::slot_of(k) == slot)
             .expect("some later key must share the slot");
         (first, second)
+    }
+
+    #[test]
+    fn an_empty_cache_is_all_zero_bytes() {
+        let empty = CodeCache::EMPTY;
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                &empty as *const CodeCache as *const u8,
+                std::mem::size_of::<CodeCache>(),
+            )
+        };
+        assert!(
+            bytes.iter().all(|&b| b == 0),
+            "a non-zero byte moves the table out of .tbss"
+        );
     }
 
     #[test]
@@ -106,9 +95,6 @@ mod tests {
 
     #[test]
     fn a_null_key_is_never_stored() {
-        // Zero is the empty marker, which is what lets the whole table
-        // live in .tbss and cost nothing to start a thread. No code
-        // object lives at address zero, so refusing it costs nothing.
         let mut cache = CodeCache::EMPTY;
         cache.put(0, 7);
         assert_eq!(cache.get(0), None);
@@ -137,9 +123,6 @@ mod tests {
 
     #[test]
     fn distinct_keys_do_not_evict_each_other() {
-        // Consecutive allocations, which is what a run of code objects
-        // from one module looks like. A cache that degenerates on this
-        // pattern is worse than no cache.
         let mut cache = CodeCache::EMPTY;
         let keys: Vec<usize> = (0..SLOTS / 2).map(|i| 0x1_0000 + i * 96).collect();
         for (i, &k) in keys.iter().enumerate() {
@@ -167,7 +150,6 @@ mod tests {
 
     #[test]
     fn a_stored_id_is_not_confused_with_a_miss() {
-        // Code ids start at zero, so the empty marker cannot be the id.
         let mut cache = CodeCache::EMPTY;
         cache.put(0x1000, 0);
         assert_eq!(cache.get(0x1000), Some(0));

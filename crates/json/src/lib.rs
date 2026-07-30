@@ -1,9 +1,3 @@
-//! Chrome Trace Event Format exporter.
-//!
-//! Correctness-first: this format exists so a trace can be eyeballed,
-//! diffed, and asserted on. The protobuf exporter is the one tuned for
-//! throughput.
-
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
@@ -13,9 +7,6 @@ pub struct JsonExporter<W: Write + Send> {
     out: W,
     first: bool,
     pid: u32,
-    /// `CodeLookup::code` takes a read lock and clones three strings.
-    /// Called per event that is contention with the tracing threads, so
-    /// each code object is resolved once and kept.
     codes: ahash::AHashMap<u32, CodeInfo>,
 }
 
@@ -37,7 +28,6 @@ impl<W: Write + Send> JsonExporter<W> {
         })
     }
 
-    /// Override the recorded pid. Tests use this so output is stable.
     pub fn with_pid(mut self, pid: u32) -> Self {
         self.pid = pid;
         self
@@ -150,14 +140,11 @@ mod tests {
         let v = export(&events, &fib_table(), &ThreadTable::new(), 0);
         let ev = v["traceEvents"].as_array().unwrap();
         assert_eq!(ev[0]["ts"], 0.0);
-        // 1500 ns is 1.5 us — integer division used to round this to 1.
         assert_eq!(ev[1]["ts"], 1.5);
     }
 
     #[test]
     fn sub_microsecond_slices_keep_their_duration() {
-        // Back-to-back calls are hundreds of ns apart. Truncating to
-        // whole microseconds would collapse them to zero-width.
         let events = [
             Event::new(0, 1, 0, EventKind::Begin),
             Event::new(300, 1, 0, EventKind::End),

@@ -52,6 +52,8 @@ jobs:
       - uses: astral-sh/setup-uv@v7
       - name: Trace a real workload
         run: uv run --python ${{ matrix.python }} scripts/smoke.py
+      - name: Invariants that need a live interpreter
+        run: uv run --python ${{ matrix.python }} pytest
 
   # The Rust tests decode our protobuf with prost, which only proves we can
   # read back what we wrote. This runs Perfetto's own trace_processor, so

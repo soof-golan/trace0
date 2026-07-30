@@ -26,19 +26,11 @@ impl Interner {
         }
     }
 
-    /// Fast path: lookup by code-object pointer. Returns None on miss.
     #[inline]
     pub fn lookup(&self, key: usize) -> Option<u32> {
         self.inner.read().map.get(&key).copied()
     }
 
-    /// Slow path. Materializes qualname/filename/firstlineno from the code
-    /// object. Runs once per code object.
-    ///
-    /// Returns `None` past `CODE_ID_MAX`: a code id shares its u32 with
-    /// the event kind, so the 2^24-th distinct code object has no
-    /// representation. Refusing it keeps the overflow from silently
-    /// rewriting the kind bits of every subsequent event.
     pub fn insert(&self, _py: Python<'_>, code: &Bound<'_, PyAny>, key: usize) -> Option<u32> {
         let qualname = code
             .getattr("co_qualname")

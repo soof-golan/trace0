@@ -1,10 +1,3 @@
-//! Perfetto protobuf exporter — the throughput-oriented format.
-//!
-//! Output is a stream of length-delimited `Trace.packet` entries, which
-//! is what Perfetto expects and what makes concatenation valid. Packets
-//! are framed by hand into a reused scratch buffer rather than by
-//! building a fresh single-packet `Trace` message per event.
-
 use prost::Message;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
@@ -15,61 +8,36 @@ pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/perfetto.protos.rs"));
 }
 
-/// `Trace.packet` is field 1, wire type 2 (length-delimited).
 const PACKET_TAG: u8 = (1 << 3) | 2;
 const SEQUENCE_ID: u32 = 1;
 const CATEGORY: &str = "py";
 
-/// Field tags, pre-resolved. A tag is `(field_number << 3) | wire_type`,
-/// varint-encoded, so fields past 15 need two bytes.
 mod tag {
-    /// `TracePacket.timestamp`, field 8, varint.
     pub const TIMESTAMP: u8 = 8 << 3;
-    /// `TracePacket.track_event`, field 11, length-delimited.
     pub const TRACK_EVENT: u8 = (11 << 3) | 2;
-    /// `TrackEvent.type`, field 9, varint.
     pub const TYPE: u8 = 9 << 3;
-    /// `TrackEvent.track_uuid`, field 11, varint.
     pub const TRACK_UUID: u8 = 11 << 3;
-    /// `TrackEvent.category_iids`, field 3, varint.
     pub const CATEGORY_IIDS: u8 = 3 << 3;
-    /// `TrackEvent.name_iid`, field 10, varint.
     pub const NAME_IID: u8 = 10 << 3;
-    /// `TracePacket.sequence_flags`, field 13, varint.
     pub const SEQUENCE_FLAGS: u8 = 13 << 3;
 }
 
-/// `SequenceFlags` from Perfetto: a reader joining the stream mid-way must
-/// know these packets only make sense with the interning table that
-/// preceded them.
 const SEQ_INCREMENTAL_STATE_CLEARED: u32 = 1;
 const SEQ_NEEDS_INCREMENTAL_STATE: u32 = 2;
 
-/// Emitted on every event packet, since all of them reference interned ids.
 const NEEDS_STATE_FIELD: [u8; 2] = [tag::SEQUENCE_FLAGS, SEQ_NEEDS_INCREMENTAL_STATE as u8];
 
-/// The single category every event carries, interned once.
 const CATEGORY_IID: u64 = 1;
 
-/// `TracePacket.trusted_packet_sequence_id`, field 10, varint, always 1.
 const SEQUENCE_FIELD: [u8; 2] = [10 << 3, SEQUENCE_ID as u8];
 
 pub struct ProtoExporter<W: Write + Send> {
     out: W,
     scratch: Vec<u8>,
-    /// Event packets for the current batch, written out in one call.
     buf: Vec<u8>,
-    /// Encoded `TrackEvent` submessages, keyed by what determines them.
-    /// Only the timestamp differs between two events sharing a key, so
-    /// the rest is encoded once and copied thereafter.
     templates: ahash::AHashMap<u64, (u32, u32)>,
     template_bytes: Vec<u8>,
-    /// Interned name id per code object. Writing `Parser._parse_expression`
-    /// into all ten million of its events is most of a trace's bytes.
     name_iids: ahash::AHashMap<u32, u64>,
-    /// Dense track uuids. The value is opaque to Perfetto, and a sparse
-    /// one like `0x7000_0000_0000_0000 | tid` costs a full 10-byte varint
-    /// on every event -- a third of the trace.
     track_uuids: ahash::AHashMap<u32, u64>,
     seen_tids: ahash::AHashSet<u32>,
     process_emitted: bool,
@@ -99,14 +67,11 @@ impl<W: Write + Send> ProtoExporter<W> {
         }
     }
 
-    /// Override the recorded pid. Tests use this so output is stable.
     pub fn with_pid(mut self, pid: i32) -> Self {
         self.pid = pid;
         self
     }
 
-    /// Frame one packet as `field 1, length-delimited` straight into the
-    /// output. No per-event `Trace` allocation, no packet clone.
     fn write_packet(&mut self, packet: &pb::TracePacket) -> io::Result<()> {
         self.scratch.clear();
         packet
@@ -119,13 +84,10 @@ impl<W: Write + Send> ProtoExporter<W> {
         self.out.write_all(&self.scratch)
     }
 
-    /// Interned id for this code object's name, emitting the name itself
-    /// into the stream the first time it is seen.
     fn name_iid(&mut self, code_id: u32, codes: &dyn CodeLookup) -> io::Result<u64> {
         if let Some(&iid) = self.name_iids.get(&code_id) {
             return Ok(iid);
         }
-        // 0 means "unset" in Perfetto's interning, so ids start at 1.
         let iid = self.name_iids.len() as u64 + 1;
         let name = codes
             .code(code_id)
@@ -148,8 +110,6 @@ impl<W: Write + Send> ProtoExporter<W> {
         Ok(iid)
     }
 
-    /// Byte range in `template_bytes` holding the encoded `track_event`
-    /// field for this combination, building it on first sight.
     fn template(
         &mut self,
         tid: u32,
@@ -157,8 +117,6 @@ impl<W: Write + Send> ProtoExporter<W> {
         opens: bool,
         codes: &dyn CodeLookup,
     ) -> io::Result<(u32, u32)> {
-        // A slice end carries no name, so every end on a thread encodes
-        // identically and needs only one template.
         let keyed_code = if opens { code_id } else { 0 };
         let key = ((tid as u64) << 32) | ((keyed_code as u64) << 1) | opens as u64;
         if let Some(&range) = self.templates.get(&key) {
@@ -176,8 +134,6 @@ impl<W: Write + Send> ProtoExporter<W> {
         });
         event.push(tag::TRACK_UUID);
         push_varint(&mut event, uuid);
-        // A slice end closes whatever the track has open, so repeating the
-        // name and category on it is pure duplication.
         if opens {
             let name_iid = self.name_iid(code_id, codes)?;
             event.push(tag::CATEGORY_IIDS);
@@ -196,9 +152,6 @@ impl<W: Write + Send> ProtoExporter<W> {
         Ok(range)
     }
 
-    /// Append one event packet. prost is bypassed here: it would build a
-    /// `TracePacket` value, walk it to compute a length, then walk it
-    /// again to encode. The shape is known, so this writes the bytes.
     fn push_event(&mut self, ts_ns: u64, template: (u32, u32)) {
         let mut ts = [0u8; 10];
         let ts_len = put_varint(&mut ts, ts_ns);
@@ -221,8 +174,6 @@ impl<W: Write + Send> ProtoExporter<W> {
         }
         self.process_emitted = true;
         let pid = self.pid;
-        // First packet on the sequence: declares that interning state
-        // starts here, and carries the one category every event shares.
         let pkt = pb::TracePacket {
             timestamp: Some(0),
             trusted_packet_sequence_id: Some(SEQUENCE_ID),
@@ -304,7 +255,6 @@ fn put_varint(buf: &mut [u8], mut v: u64) -> usize {
     }
 }
 
-/// Uuid 1 is the process; threads take 2 upward in first-seen order.
 const PROCESS_UUID: u64 = 1;
 
 impl<W: Write + Send> Exporter for ProtoExporter<W> {
@@ -330,8 +280,6 @@ impl<W: Write + Send> Exporter for ProtoExporter<W> {
         _threads: &dyn ThreadNames,
         dropped: u64,
     ) -> io::Result<()> {
-        // Surface loss in-band. Without this the protobuf path gives a
-        // reader no way to tell a complete trace from a truncated one.
         if dropped > 0 {
             self.ensure_process()?;
             let pkt = pb::TracePacket {
@@ -359,8 +307,6 @@ mod tests {
     use super::*;
     use trace0_core::{CodeInfo, CodeTable, EventKind, ThreadTable};
 
-    /// Split a raw stream back into `TracePacket`s by walking the
-    /// field-1 framing this exporter writes.
     fn packets(raw: &[u8]) -> Vec<pb::TracePacket> {
         let mut out = Vec::new();
         let mut i = 0;
@@ -417,9 +363,6 @@ mod tests {
             .collect()
     }
 
-    /// Resolve a track event's name through the interning table, the way
-    /// a real consumer must. Names appear once in an `interned_data`
-    /// packet; events carry only the id.
     fn interned_names(pkts: &[pb::TracePacket]) -> std::collections::HashMap<u64, String> {
         pkts.iter()
             .filter_map(|p| p.interned_data.as_ref())
@@ -461,7 +404,6 @@ mod tests {
         assert_eq!(interned.len(), 1, "one code object, one interned name");
         assert_eq!(interned[0].name.as_deref(), Some("fib"));
 
-        // The name must not appear in the byte stream once per event.
         let occurrences = raw.windows(3).filter(|w| *w == b"fib").count();
         assert_eq!(occurrences, 1, "name repeated in the encoded stream");
 
@@ -515,8 +457,6 @@ mod tests {
             .iter()
             .find(|te| te.r#type == Some(pb::track_event::Type::SliceEnd as i32))
             .expect("no slice end");
-        // The track already knows which slice is open; repeating its name
-        // on the end would be duplication on half of every trace.
         assert_eq!(end.name_iid, None);
         assert!(end.category_iids.is_empty());
         assert!(end.track_uuid.is_some());
@@ -570,7 +510,6 @@ mod tests {
             0,
         );
         let pkts = packets(&raw);
-        // process descriptor + interned name + thread descriptor + the event
         assert_eq!(pkts.len(), 4);
     }
 
@@ -647,6 +586,48 @@ mod tests {
             named,
             vec![(1, "MainThread".to_string()), (2, "cpu-a".to_string())]
         );
+    }
+
+    #[test]
+    fn interned_ids_start_at_one() {
+        let mut codes = CodeTable::new();
+        codes.push_named("alpha");
+        codes.push_named("beta");
+        let raw = export(
+            &[
+                Event::new(0, 7, 0, EventKind::Begin),
+                Event::new(10, 7, 1, EventKind::Begin),
+            ],
+            &codes,
+            &ThreadTable::new(),
+            0,
+        );
+        let mut iids: Vec<u64> = interned_names(&packets(&raw)).into_keys().collect();
+        iids.sort();
+        assert_eq!(iids, vec![1, 2], "zero is Perfetto's \"unset\"");
+    }
+
+    #[test]
+    fn the_process_is_uuid_one_and_threads_follow_in_first_seen_order() {
+        let raw = export(
+            &[
+                Event::new(0, 30, 0, EventKind::Begin),
+                Event::new(10, 10, 0, EventKind::Begin),
+                Event::new(20, 20, 0, EventKind::Begin),
+            ],
+            &fib_table(),
+            &ThreadTable::new(),
+            0,
+        );
+        let pkts = packets(&raw);
+        let ds = descriptors(&pkts);
+        let proc = ds.iter().find(|d| d.process.is_some()).unwrap();
+        assert_eq!(proc.uuid, Some(1));
+        let assigned: Vec<(i32, u64)> = ds
+            .iter()
+            .filter_map(|d| Some((d.thread.as_ref()?.tid?, d.uuid?)))
+            .collect();
+        assert_eq!(assigned, vec![(30, 2), (10, 3), (20, 4)]);
     }
 
     #[test]

@@ -44,8 +44,6 @@ impl Tracer {
             return Err(PyRuntimeError::new_err("tracer already started"));
         }
 
-        // Anchor the clock before any event can be recorded, so every
-        // timestamp is a non-negative offset from the trace start.
         let queue = Arc::new(EventQueue::new(Clock::starting_now()));
         let interner = Arc::new(Interner::new());
         let threads = Arc::new(ThreadRegistry::new());
@@ -86,11 +84,6 @@ impl Tracer {
         };
 
         monitoring::disable(py, &h.monitoring)?;
-        // Drain the calling thread's partial batch (worker threads
-        // do this via Cold::Drop on exit; the thread that runs
-        // `stop` is still alive). Safe to touch its TLS now —
-        // `monitoring::disable` returned so no callbacks fire here
-        // anymore.
         COLD.with_borrow_mut(|cold| cold.flush_partial(hot()));
         h.queue.close();
 

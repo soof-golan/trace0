@@ -14,23 +14,12 @@ use trace0_core::{
 };
 
 pub struct State {
-    /// `queue.id()`, kept off the queue's own cache line -- see
-    /// [`EventQueue::push_with_ctx`].
     pub run: u64,
     pub queue: Arc<EventQueue>,
     pub interner: Arc<Interner>,
     pub threads: Arc<ThreadRegistry>,
 }
 
-/// Resolve a code object this thread has not seen, and name the thread if
-/// it still needs naming.
-///
-/// Outlined deliberately. Inlined, its interner lock and Python calls put
-/// a 480-byte frame and twelve register spills into the callback's
-/// prologue -- paid on every event, to run on almost none of them.
-///
-/// Returns the code id, or `None` past the 24-bit ceiling, where dropping
-/// the event beats corrupting the kind bits of every later one.
 #[cold]
 #[inline(never)]
 fn resolve_cold(
@@ -40,9 +29,6 @@ fn resolve_cold(
     key: usize,
     hot: &mut trace0_core::tls::Hot,
 ) -> Option<u32> {
-    // Everything this thread learned belongs to whichever run taught it.
-    // A restarted tracer has a fresh interner numbering from zero and a
-    // fresh registry that has never heard of this thread.
     if hot.queue_id != state.run {
         *codes() = CodeCache::EMPTY;
         hot.last_code_key = trace0_core::tls::NOT_CACHED;
@@ -51,14 +37,9 @@ fn resolve_cold(
     if hot.tid == u32::MAX {
         hot.tid = os_tid();
     }
-    // `ensure` is best-effort: a brand-new thread reports itself as
-    // `Dummy-N` until `threading` registers it, so latching on the first
-    // attempt would leave every worker thread unnamed.
     if !hot.ensured {
         hot.ensured = state.threads.ensure(py, hot.tid);
     }
-    // Never held across the Python calls around it: a callback that
-    // re-entered would alias it.
     let id = match codes().get(key) {
         Some(id) => id,
         None => {
@@ -71,8 +52,6 @@ fn resolve_cold(
         }
     };
     hot.last_code_id = id;
-    // Arm the fast path only once the thread is fully settled, so a
-    // single compare against `last_code_key` also covers naming.
     hot.last_code_key = if hot.ensured {
         key
     } else {
@@ -85,18 +64,11 @@ fn resolve_cold(
 fn record(py: Python<'_>, state: &State, code: pyo3::Borrowed<'_, '_, PyAny>, kind: EventKind) {
     let key = code.as_ptr() as usize;
     let hot = hot();
-    // The counter and the scale factor that converts it must come from
-    // one source. `clock_direct` is that clock's own answer about whether
-    // its counter can be read inline, cached here to save chasing the
-    // queue on every event.
     let ticks = if hot.clock_direct {
         read_counter()
     } else {
         state.queue.clock().raw()
     };
-    // Two compares cover everything a settled thread has already done:
-    // same code object as last time, id assigned, thread named, and all
-    // of it learned during *this* tracer run rather than a previous one.
     let code_id = if hot.last_code_key == key && hot.queue_id == state.run {
         hot.last_code_id
     } else {
@@ -115,14 +87,6 @@ pub struct Callbacks {
     state: Arc<State>,
 }
 
-/// Shared `METH_FASTCALL` body for every event variant.
-///
-/// `slf` is the `Callbacks` pyclass instance bound at registration
-/// (passed as the `self` arg of `PyCFunction_NewEx`). We read `args[0]`
-/// (the code object) and ignore everything else — `instruction_offset`,
-/// `retval`, `exc` — without ever wrapping them. Skips per-event
-/// `Bound<PyAny>` construction and `i64` extraction that PyO3's
-/// `#[pymethod]` thunk would otherwise do.
 fn fastcall_record(
     slf: *mut ffi::PyObject,
     args: *mut *mut ffi::PyObject,
@@ -130,12 +94,6 @@ fn fastcall_record(
     kind: EventKind,
 ) -> *mut ffi::PyObject {
     if nargs >= 1 {
-        // SAFETY: sys.monitoring dispatches callbacks from the interpreter
-        // loop, on a thread that is attached for the whole call. Nothing
-        // derived from this token escapes `record`.
-        //
-        // `Python::attach` would re-establish that state at ~35ns per
-        // event, several times what this callback's actual work costs.
         let py = unsafe { Python::assume_attached() };
         let cb_obj = unsafe { pyo3::Borrowed::<'_, '_, PyAny>::from_ptr(py, slf) };
         let b = unsafe { cb_obj.cast_unchecked::<Callbacks>() };
@@ -167,8 +125,6 @@ make_cb!(cb_py_throw, EventKind::Throw);
 
 #[repr(transparent)]
 struct MethodDef(ffi::PyMethodDef);
-// Safe: PyMethodDef contains raw pointers, but for static method tables
-// the pointers are to constant data and a never-mutated function entry.
 unsafe impl Sync for MethodDef {}
 
 const fn method_def(name: &'static CStr, fp: ffi::PyCFunctionFast) -> MethodDef {
@@ -200,9 +156,6 @@ const PAIRS: [(&str, &MethodDef); 6] = [
 
 pub struct MonitoringHandle {
     pub tool_id: u8,
-    // Held, not read: these keep the callback objects and the shared
-    // `Callbacks` instance alive for as long as sys.monitoring can
-    // still invoke them.
     #[allow(dead_code)]
     pub callbacks: Py<Callbacks>,
     #[allow(dead_code)]
