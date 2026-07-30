@@ -68,6 +68,16 @@ uvx --with httpx --python 3.13t trace0 run --output trace.pb your_script.py
 Free-threaded builds (3.13t, 3.14t) are a first-class target — every thread is
 traced, not just the calling one.
 
+`-m` runs a library module, exactly as `python -m` does; everything after the
+module name belongs to it:
+
+```bash
+uvx --with uvicorn trace0 run --output trace.pb -m uvicorn app:app --port 8000
+```
+
+A server traced from launch spends most of its trace importing. To trace only
+the part you care about, wrap it with the `Tracer` API below instead.
+
 ## Install
 
 Install it for the `Tracer` API, which also puts the same CLI on your

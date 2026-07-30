@@ -12,11 +12,12 @@ from pathlib import Path
 import pytest
 
 
-def trace0(*args: str) -> subprocess.CompletedProcess:
+def trace0(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, "-m", "trace0", *args],
         capture_output=True,
         text=True,
+        cwd=cwd,
     )
 
 
@@ -27,6 +28,7 @@ def trace0(*args: str) -> subprocess.CompletedProcess:
         "Output format",
         "Python script to run",
         "Arguments forwarded",
+        "library module",
         "[default: protobuf]",
     ],
 )
@@ -68,6 +70,98 @@ def test_the_script_sees_its_own_arguments(tmp_path: Path):
     )
     assert result.returncode == 0, result.stderr
     assert "['a', 'b']" in result.stdout
+
+
+def names_in(out: Path) -> set[str]:
+    trace = json.loads(out.read_text())
+    return {e["name"] for e in trace["traceEvents"] if e["ph"] == "B"}
+
+
+def test_a_module_runs_like_python_dash_m(tmp_path: Path):
+    (tmp_path / "workload.py").write_text("def f():\n    return 1\n\nf()\n")
+    out = tmp_path / "out.json"
+
+    result = trace0(
+        "run", "--output", str(out), "--format", "json", "-m", "workload", cwd=tmp_path
+    )
+    assert result.returncode == 0, result.stderr
+    assert "f" in names_in(out)
+
+
+def test_a_package_runs_its_dunder_main(tmp_path: Path):
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "__main__.py").write_text("def g():\n    return 2\n\ng()\n")
+    out = tmp_path / "out.json"
+
+    result = trace0(
+        "run", "--output", str(out), "--format", "json", "-m", "pkg", cwd=tmp_path
+    )
+    assert result.returncode == 0, result.stderr
+    assert "g" in names_in(out)
+
+
+def test_a_module_sees_its_own_arguments(tmp_path: Path):
+    """`python -m mod a b` gives the module `sys.argv[1:] == ['a', 'b']`, and
+    `sys.argv[0]` set to the module's file rather than its name."""
+    (tmp_path / "argv.py").write_text(
+        "import sys\nprint(sys.argv[1:])\nprint(sys.argv[0].endswith('argv.py'))\n"
+    )
+
+    result = trace0(
+        "run",
+        "--output",
+        str(tmp_path / "out.json"),
+        "--format",
+        "json",
+        "-m",
+        "argv",
+        "a",
+        "b",
+        cwd=tmp_path,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "['a', 'b']" in result.stdout
+    assert "True" in result.stdout
+
+
+def test_a_module_keeps_arguments_that_look_like_flags(tmp_path: Path):
+    """Everything after the module name belongs to the module, including
+    arguments that collide with trace0's own flags."""
+    (tmp_path / "flags.py").write_text("import sys\nprint(sys.argv[1:])\n")
+
+    result = trace0(
+        "run",
+        "--output",
+        str(tmp_path / "out.json"),
+        "--format",
+        "json",
+        "-m",
+        "flags",
+        "--output",
+        "theirs.txt",
+        "-v",
+        cwd=tmp_path,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "['--output', 'theirs.txt', '-v']" in result.stdout
+    assert not (tmp_path / "theirs.txt").exists()
+
+
+def test_a_missing_module_fails_without_writing_a_trace(tmp_path: Path):
+    out = tmp_path / "out.json"
+    result = trace0(
+        "run", "--output", str(out), "--format", "json", "-m", "no_such_module",
+        cwd=tmp_path,
+    )
+    assert result.returncode != 0
+    assert "no_such_module" in result.stderr
+
+
+def test_a_run_needs_either_a_script_or_a_module(tmp_path: Path):
+    result = trace0("run", "--output", str(tmp_path / "out.json"))
+    assert result.returncode != 0
 
 
 def test_an_unknown_format_is_rejected(tmp_path: Path):
