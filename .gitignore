@@ -19,9 +19,5 @@ target/
 # maturin develop drops compiled extensions next to the Python sources
 *.so
 
-# Generated trace artifacts
-examples/*.json
-examples/*.pb
-
 # Worktrees created for isolated background agents
 .claude/worktrees/
