@@ -6,8 +6,12 @@ use pyo3::types::PyAny;
 use std::ffi::CStr;
 use std::sync::Arc;
 use trace0_core::clock::read_counter;
+use trace0_core::codecache::CodeCache;
 use trace0_core::event::{EventKind, os_tid};
-use trace0_core::{EventQueue, tls::hot};
+use trace0_core::{
+    EventQueue,
+    tls::{codes, hot},
+};
 
 pub struct State {
     /// `queue.id()`, copied here because this struct is on the hot path
@@ -40,6 +44,7 @@ fn resolve_cold(
     // A restarted tracer has a fresh interner numbering from zero and a
     // fresh registry that has never heard of this thread.
     if hot.queue_id != state.run {
+        *codes() = CodeCache::EMPTY;
         hot.last_code_key = trace0_core::tls::NOT_CACHED;
         hot.ensured = false;
     }
@@ -52,10 +57,22 @@ fn resolve_cold(
     if !hot.ensured {
         hot.ensured = state.threads.ensure(py, hot.tid);
     }
-    let id = state
-        .interner
-        .lookup(key)
-        .or_else(|| state.interner.insert(py, &code, key))?;
+    // The interner is shared, so a miss here is a lock every traced
+    // thread queues behind. `codes()` is this thread's alone.
+    //
+    // Never held across the Python calls above or below: a callback that
+    // re-entered would alias it.
+    let id = match codes().get(key) {
+        Some(id) => id,
+        None => {
+            let id = state
+                .interner
+                .lookup(key)
+                .or_else(|| state.interner.insert(py, &code, key))?;
+            codes().put(key, id);
+            id
+        }
+    };
     hot.last_code_id = id;
     // Arm the fast path only once the thread is fully settled, so a
     // single compare against `last_code_key` also covers naming.

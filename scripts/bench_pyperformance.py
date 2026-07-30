@@ -11,6 +11,7 @@ workload executes exactly once and pyperf reports its own timing,
 excluding interpreter startup.
 
     uv run --python 3.13t scripts/bench_pyperformance.py
+    uv run --python 3.13t scripts/bench_pyperformance.py raytrace richards
 """
 
 import re
@@ -112,6 +113,17 @@ def count_events(trace: Path) -> int:
     return total
 
 
+def selected() -> list[str]:
+    """Named benchmarks, or all of them. Naming a few keeps an A/B of one
+    change down to the benchmarks that change is supposed to affect."""
+    if not sys.argv[1:]:
+        return BENCHMARKS
+    unknown = set(sys.argv[1:]) - set(BENCHMARKS)
+    if unknown:
+        raise SystemExit(f"unknown benchmarks: {sorted(unknown)}")
+    return [b for b in BENCHMARKS if b in set(sys.argv[1:])]
+
+
 def main() -> int:
     root = suite_dir()
     print(
@@ -120,7 +132,7 @@ def main() -> int:
     )
     rows = []
     with tempfile.TemporaryDirectory() as d:
-        for name in BENCHMARKS:
+        for name in selected():
             script = root / f"bm_{name}" / "run_benchmark.py"
             if not script.exists():
                 continue

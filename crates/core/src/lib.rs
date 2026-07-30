@@ -7,6 +7,7 @@
 //! [`clock::Clock`].
 
 pub mod clock;
+pub mod codecache;
 pub mod event;
 pub mod evqueue;
 pub mod pipeline;

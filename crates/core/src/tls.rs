@@ -12,6 +12,7 @@
 //! producer, keeps the destructor, and is reached only when a batch fills
 //! or a thread records its first event.
 
+use crate::codecache::CodeCache;
 use crate::event::PackedEvent;
 use crate::evqueue::{BATCH_N, EventBatch};
 use rtrb::Producer;
@@ -147,6 +148,7 @@ impl Drop for Cold {
 
 thread_local! {
     static HOT: UnsafeCell<Hot> = const { UnsafeCell::new(Hot::EMPTY) };
+    static CODES: UnsafeCell<CodeCache> = const { UnsafeCell::new(CodeCache::EMPTY) };
     pub static COLD: RefCell<Cold> = const {
         RefCell::new(Cold {
             producer: None,
@@ -174,5 +176,24 @@ thread_local! {
 #[allow(clippy::mut_from_ref)]
 pub fn hot() -> &'static mut Hot {
     let ptr = HOT.with(|cell| cell.get());
+    unsafe { &mut *ptr }
+}
+
+/// This thread's code-object cache, consulted when [`Hot::last_code_key`]
+/// misses.
+///
+/// Deliberately a separate slot rather than a field of [`Hot`]: the table
+/// is 4 KiB, and folding it in would put a second cache line on the path
+/// of every event, including the ones that hit the single cached entry
+/// and never look at the table at all.
+///
+/// # Safety
+///
+/// As [`hot`]: no destructor, so the slot outlives any reference to it,
+/// and no caller may run Python while the reference is live.
+#[inline(always)]
+#[allow(clippy::mut_from_ref)]
+pub fn codes() -> &'static mut CodeCache {
+    let ptr = CODES.with(|cell| cell.get());
     unsafe { &mut *ptr }
 }
