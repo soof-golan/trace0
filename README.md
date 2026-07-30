@@ -10,27 +10,40 @@ to a background thread over lock-free SPSC rings. It emits
 
 ## How much does it cost?
 
-Transpiling SQL with [sqlglot](https://github.com/tobymao/sqlglot) — pure
-Python, parser-heavy, 10.8M events in a second of work — on an M4 Mac,
-measured with `hyperfine`:
+Across 14 benchmarks from [pyperformance](https://github.com/python/pyperformance),
+the suite CPython itself is judged on, run unmodified on an M4 Mac:
 
-| | wall time | vs vanilla | overhead per event |
-| --- | --- | --- | --- |
-| vanilla | 0.99 s | — | — |
-| **trace0** (protobuf) | **1.39 s** | **1.43×** | **39 ns** |
-| `cProfile` | 2.40 s | 2.43× | 131 ns |
-| `profile` | 19.27 s | 19.5× | 1.9 µs |
+**Median slowdown 1.19×, ranging 0.99× to 1.49×.**
+
+| | slowdown | |
+| --- | --- | --- |
+| `telco`, `scimark`, `fannkuch`, `nbody` | 0.99–1.03× | arithmetic in tight loops |
+| `pyflate`, `chaos`, `float`, `go` | 1.17–1.22× | |
+| `raytrace`, `hexiom`, `deltablue`, `richards` | 1.40–1.49× | call-heavy |
+
+The spread *is* the story: a tracer charges per call, so what a program
+pays depends entirely on how many calls it makes per unit of work, not on
+how long it runs. Reproduce with `scripts/bench_pyperformance.py`.
+
+Against the alternatives, on a call-dense workload — transpiling SQL with
+[sqlglot](https://github.com/tobymao/sqlglot), 10.8M events per second of
+work, measured with `hyperfine`:
+
+| | wall time | vs vanilla |
+| --- | --- | --- |
+| vanilla | 0.98 s | — |
+| **trace0** (protobuf) | **1.38 s** | **1.41×** |
+| `cProfile` | 2.42 s | 2.47× |
+| `profile` | 19.27 s | 19.5× |
 
 trace0 costs about a third of what `cProfile` does *and* keeps every event,
-where `cProfile` only keeps per-function aggregates. The trace was 317MB —
+where `cProfile` only keeps per-function aggregates. That trace was 210MB —
 a full timeline is not free, it is just cheaper in time than in disk.
 
-Reproduce with `scripts/workload_sqlglot.py`. Microbenchmark the callback
-alone with `scripts/bench_producer.py`, which reports the difference against
-the same workload untraced: ~6 ns per event at 8 threads, ~37 ns on one
-thread, of which ~19 ns is CPython's own `sys.monitoring` dispatch rather
-than anything trace0 does. An event is one `PY_START` or `PY_RETURN`, so a
-function call is two.
+For the callback in isolation, `scripts/bench_producer.py` reports the
+difference against the same workload untraced: **~5 ns per event at 8
+threads**, ~14 ns on a single thread. An event is one `PY_START` or
+`PY_RETURN`, so a function call is two.
 
 ## Try it, without installing anything
 
