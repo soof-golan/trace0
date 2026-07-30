@@ -49,7 +49,13 @@ def test_protobuf_answers_to_its_short_names(tmp_path, alias):
     assert out.read_bytes()[0] == PACKET_TAG
 
 
-def test_an_unknown_format_is_rejected(tmp_path):
-    tracer = Tracer(str(tmp_path / "out"), format="yaml")
-    with pytest.raises(OSError, match="unknown format"):
-        tracer.start()
+def test_none_is_not_a_way_to_ask_for_the_default(tmp_path):
+    with pytest.raises(TypeError):
+        Tracer(str(tmp_path / "out"), format=None)
+
+
+def test_an_unknown_format_is_rejected_before_anything_is_opened(tmp_path):
+    out = tmp_path / "out"
+    with pytest.raises(ValueError, match="unknown format: yaml"):
+        Tracer(str(out), format="yaml")
+    assert not out.exists()

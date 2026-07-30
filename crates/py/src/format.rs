@@ -10,14 +10,11 @@ pub enum Format {
 }
 
 impl Format {
-    pub fn parse(s: &str) -> io::Result<Self> {
+    pub fn parse(s: &str) -> Result<Self, String> {
         match s {
             "json" => Ok(Format::Json),
             "protobuf" | "proto" | "pb" => Ok(Format::Protobuf),
-            other => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("unknown format: {other}"),
-            )),
+            other => Err(format!("unknown format: {other}")),
         }
     }
 
@@ -34,8 +31,4 @@ impl Format {
             Format::Protobuf => Box::new(ProtoExporter::create(path)?),
         })
     }
-}
-
-pub fn make_exporter(format: &str, path: &str) -> io::Result<Box<dyn Exporter>> {
-    Format::parse(format)?.open(path)
 }

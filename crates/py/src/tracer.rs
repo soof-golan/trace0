@@ -1,9 +1,9 @@
-use crate::format::make_exporter;
+use crate::format::Format;
 use crate::intern::Interner;
 use crate::monitoring::{self, MonitoringHandle, State};
 use crate::threads::ThreadRegistry;
 use parking_lot::Mutex;
-use pyo3::exceptions::{PyIOError, PyRuntimeError};
+use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyType;
 use std::sync::Arc;
@@ -22,20 +22,20 @@ struct RunningHandle {
 #[pyclass(module = "trace0._core")]
 pub struct Tracer {
     output: String,
-    format: String,
+    format: Format,
     handle: Mutex<Option<RunningHandle>>,
 }
 
 #[pymethods]
 impl Tracer {
     #[new]
-    #[pyo3(signature = (output, format = None))]
-    pub(crate) fn new(output: String, format: Option<String>) -> Self {
-        Self {
+    #[pyo3(signature = (output, format = "protobuf".to_string()))]
+    pub(crate) fn new(output: String, format: String) -> PyResult<Self> {
+        Ok(Self {
             output,
-            format: format.unwrap_or_else(|| "protobuf".to_string()),
+            format: Format::parse(&format).map_err(PyValueError::new_err)?,
             handle: Mutex::new(None),
-        }
+        })
     }
 
     pub(crate) fn start(&self, py: Python<'_>) -> PyResult<()> {
@@ -54,7 +54,9 @@ impl Tracer {
             threads: threads.clone(),
         });
 
-        let exporter = make_exporter(&self.format, &self.output)
+        let exporter = self
+            .format
+            .open(&self.output)
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
         let exporter_thread = {
