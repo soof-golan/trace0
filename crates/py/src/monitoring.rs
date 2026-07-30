@@ -5,8 +5,9 @@ use pyo3::prelude::*;
 use pyo3::types::PyAny;
 use std::ffi::CStr;
 use std::sync::Arc;
+use trace0_core::clock::read_counter;
 use trace0_core::event::{EventKind, os_tid};
-use trace0_core::{EventQueue, tls::CTX};
+use trace0_core::{EventQueue, tls::hot};
 
 pub struct State {
     pub queue: Arc<EventQueue>,
@@ -14,41 +15,74 @@ pub struct State {
     pub threads: Arc<ThreadRegistry>,
 }
 
+/// Resolve a code object this thread has not seen, and name the thread if
+/// it still needs naming.
+///
+/// Outlined deliberately. Inlined, its interner lock and Python calls put
+/// a 480-byte frame and twelve register spills into the callback's
+/// prologue -- paid on every event, to run on almost none of them.
+///
+/// Returns the code id, or `None` past the 24-bit ceiling, where dropping
+/// the event beats corrupting the kind bits of every later one.
+#[cold]
+#[inline(never)]
+fn resolve_cold(
+    py: Python<'_>,
+    state: &State,
+    code: pyo3::Borrowed<'_, '_, PyAny>,
+    key: usize,
+    hot: &mut trace0_core::tls::Hot,
+) -> Option<u32> {
+    if hot.tid == u32::MAX {
+        hot.tid = os_tid();
+    }
+    // `ensure` is best-effort: a brand-new thread reports itself as
+    // `Dummy-N` until `threading` registers it, so latching on the first
+    // attempt would leave every worker thread unnamed.
+    if !hot.ensured {
+        hot.ensured = state.threads.ensure(py, hot.tid);
+    }
+    let id = state
+        .interner
+        .lookup(key)
+        .or_else(|| state.interner.insert(py, &code, key))?;
+    hot.last_code_id = id;
+    // Arm the fast path only once the thread is fully settled, so a
+    // single compare against `last_code_key` also covers naming.
+    hot.last_code_key = if hot.ensured {
+        key
+    } else {
+        trace0_core::tls::NOT_CACHED
+    };
+    Some(id)
+}
+
 #[inline]
 fn record(py: Python<'_>, state: &State, code: pyo3::Borrowed<'_, '_, PyAny>, kind: EventKind) {
     let key = code.as_ptr() as usize;
-    // Read through the queue's own clock: the counter and the scale
-    // factor that converts it must come from the same source.
-    let ticks = state.queue.clock().raw();
-    CTX.with_borrow_mut(|ctx| {
-        if ctx.tid == u32::MAX {
-            ctx.tid = os_tid();
+    let hot = hot();
+    // The counter and the scale factor that converts it must come from
+    // one source. `clock_direct` is that clock's own answer about whether
+    // its counter can be read inline, cached here to save chasing the
+    // queue on every event.
+    let ticks = if hot.clock_direct {
+        read_counter()
+    } else {
+        state.queue.clock().raw()
+    };
+    // One compare covers everything a settled thread has already done:
+    // same code object as last time, id assigned, thread named.
+    let code_id = if hot.last_code_key == key {
+        hot.last_code_id
+    } else {
+        match resolve_cold(py, state, code, key, hot) {
+            Some(id) => id,
+            None => return,
         }
-        let tid = ctx.tid;
-        let code_id = if ctx.last_code_key == key && ctx.last_code_id != u32::MAX {
-            ctx.last_code_id
-        } else {
-            let Some(id) = state
-                .interner
-                .lookup(key)
-                .or_else(|| state.interner.insert(py, &code, key))
-            else {
-                // Past the 24-bit code-id ceiling; drop rather than
-                // corrupt the kind bits of this event.
-                return;
-            };
-            ctx.last_code_key = key;
-            ctx.last_code_id = id;
-            id
-        };
-        // `ensure` is best-effort: a brand-new thread reports itself as
-        // `Dummy-N` until `threading` registers it, so latching on the
-        // first attempt would leave every worker thread unnamed.
-        if !ctx.ensured {
-            ctx.ensured = state.threads.ensure(py, tid);
-        }
-        state.queue.push_with_ctx(ctx, ticks, tid, code_id, kind);
-    });
+    };
+    state
+        .queue
+        .push_with_ctx(hot, ticks, hot.tid, code_id, kind);
 }
 
 #[pyclass(module = "trace0._core", frozen)]

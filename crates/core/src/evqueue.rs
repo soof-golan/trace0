@@ -1,6 +1,6 @@
 use crate::clock::Clock;
 use crate::event::{Event, EventKind, PackedEvent, pack_code_kind};
-use crate::tls::PerThread;
+use crate::tls::{COLD, Cold, Hot};
 use parking_lot::{Condvar, Mutex};
 use rtrb::{Consumer, RingBuffer};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -66,77 +66,83 @@ impl EventQueue {
         &self.clock
     }
 
-    /// Push using the caller's `PerThread` context (already borrowed).
+    /// Push into this thread's current batch.
     /// Computes the per-batch tick delta inline; force-closes the batch
     /// on rare > u32::MAX-tick gaps so deltas always fit in u32.
     #[inline]
     pub fn push_with_ctx(
         &self,
-        ctx: &mut PerThread,
+        hot: &mut Hot,
         ticks: u64,
         tid: u32,
         code_id: u32,
         kind: EventKind,
     ) {
-        let q_id = self as *const _ as usize;
-        let stale = match &ctx.producer {
-            Some((id, _)) => *id != q_id,
-            None => true,
-        };
-        if stale {
-            self.init_producer(ctx, ticks, tid);
-        }
         let code_kind = pack_code_kind(code_id, kind);
-        // Hot path: single mut borrow of batch, push, branch on len.
-        let batch = ctx.batch.as_mut().unwrap();
-        let delta = ticks.wrapping_sub(batch.base_ticks);
-        if delta <= DELTA_OVERFLOW {
-            batch.events.push(PackedEvent {
-                delta_ticks: delta as u32,
-                code_kind,
-            });
-            if batch.events.len() < BATCH_N {
-                return;
+        let delta = ticks.wrapping_sub(hot.base_ticks);
+        // One branch covers every case the hot path does not handle: no
+        // batch yet (null cursor), batch full, or a delta too wide for u32.
+        if hot.cursor < hot.end && delta <= DELTA_OVERFLOW {
+            // SAFETY: `cursor` is below `end`, so it addresses a slot
+            // inside the current batch's buffer.
+            unsafe {
+                hot.cursor.write(PackedEvent {
+                    delta_ticks: delta as u32,
+                    code_kind,
+                });
+                hot.cursor = hot.cursor.add(1);
             }
+            return;
         }
-        // Cold paths: batch full or delta overflow.
-        self.slow_path(ctx, ticks, tid, code_kind, delta > DELTA_OVERFLOW);
+        self.slow_path(hot, ticks, tid, code_kind);
     }
 
     #[cold]
     #[inline(never)]
-    fn init_producer(&self, ctx: &mut PerThread, ticks: u64, tid: u32) {
+    fn init_producer(&self, cold: &mut Cold, hot: &mut Hot, ticks: u64, tid: u32) {
         let (prod, cons) = RingBuffer::<Box<EventBatch>>::new(BATCHES_CAPACITY);
         self.consumers.lock().push(cons);
-        ctx.producer = Some((self as *const _ as usize, prod));
-        ctx.batch = Some(Box::new(EventBatch::with_capacity(BATCH_N, ticks, tid)));
+        cold.producer = Some((self as *const _ as usize, prod));
+        cold.batch = Some(Box::new(EventBatch::with_capacity(BATCH_N, ticks, tid)));
+        hot.clock_direct = self.clock.is_direct();
+        cold.arm(hot);
     }
 
+    /// Everything the hot path bailed out of: first event on this thread,
+    /// a full batch, or a tick gap too wide to encode as a u32 delta. All
+    /// three end the same way -- a fresh batch anchored at `ticks`, with
+    /// this event as its first entry.
     #[cold]
     #[inline(never)]
-    fn slow_path(
-        &self,
-        ctx: &mut PerThread,
-        ticks: u64,
-        tid: u32,
-        code_kind: u32,
-        was_overflow: bool,
-    ) {
-        self.ship_and_renew(ctx, ticks, tid);
-        if was_overflow {
-            // After overflow the previous batch was shipped without
-            // recording this event; push it into the fresh batch.
-            ctx.batch.as_mut().unwrap().events.push(PackedEvent {
+    fn slow_path(&self, hot: &mut Hot, ticks: u64, tid: u32, code_kind: u32) {
+        let q_id = self as *const _ as usize;
+        COLD.with(|cold| {
+            let cold = &mut *cold.borrow_mut();
+            let stale = match &cold.producer {
+                Some((id, _)) => *id != q_id,
+                None => true,
+            };
+            if stale {
+                self.init_producer(cold, hot, ticks, tid);
+            } else {
+                self.ship_and_renew(cold, hot, ticks, tid);
+            }
+        });
+        // SAFETY: both paths leave an armed cursor on an empty batch.
+        unsafe {
+            hot.cursor.write(PackedEvent {
                 delta_ticks: 0,
                 code_kind,
             });
+            hot.cursor = hot.cursor.add(1);
         }
     }
 
     #[inline]
-    fn ship_and_renew(&self, ctx: &mut PerThread, base_ticks: u64, tid: u32) {
-        let full = ctx.batch.take().unwrap();
-        let (_, prod) = ctx.producer.as_mut().unwrap();
+    fn ship_and_renew(&self, cold: &mut Cold, hot: &mut Hot, base_ticks: u64, tid: u32) {
+        cold.commit(hot);
+        let full = cold.batch.take().unwrap();
+        let (_, prod) = cold.producer.as_mut().unwrap();
         let dropped = full.events.len();
         if let Err(rtrb::PushError::Full(returned)) = prod.push(full) {
             self.dropped.fetch_add(dropped as u64, Ordering::Relaxed);
@@ -144,12 +150,13 @@ impl EventQueue {
             reused.events.clear();
             reused.base_ticks = base_ticks;
             reused.tid = tid;
-            ctx.batch = Some(reused);
+            cold.batch = Some(reused);
         } else {
-            ctx.batch = Some(Box::new(EventBatch::with_capacity(
+            cold.batch = Some(Box::new(EventBatch::with_capacity(
                 BATCH_N, base_ticks, tid,
             )));
         }
+        cold.arm(hot);
     }
 
     #[inline]
@@ -231,7 +238,7 @@ impl EventQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tls::CTX;
+    use crate::tls::hot;
 
     /// Ticks are nanoseconds on a mock clock, so a test can state the
     /// timestamps it expects directly.
@@ -240,16 +247,15 @@ mod tests {
     }
 
     /// Push through the real thread-local context, then drain. Runs on
-    /// its own thread so each test gets a fresh `CTX`.
+    /// its own thread so each test gets fresh thread-local state.
     fn push_and_drain(clock: Clock, pushes: Vec<(u64, u32, u32, EventKind)>) -> Vec<Event> {
         std::thread::spawn(move || {
             let q = EventQueue::new(clock);
-            CTX.with_borrow_mut(|ctx| {
-                for (ticks, tid, code, kind) in pushes {
-                    q.push_with_ctx(ctx, ticks, tid, code, kind);
-                }
-                ctx.flush_partial();
-            });
+            let hot = hot();
+            for (ticks, tid, code, kind) in pushes {
+                q.push_with_ctx(hot, ticks, tid, code, kind);
+            }
+            COLD.with_borrow_mut(|cold| cold.flush_partial(hot));
             let mut out = Vec::new();
             q.drain_nonblocking(&mut out, usize::MAX);
             out

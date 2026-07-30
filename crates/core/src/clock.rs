@@ -88,6 +88,13 @@ impl Clock {
         )
     }
 
+    /// Whether [`read_counter`] may be called instead of [`Clock::raw`].
+    /// Only this clock can answer that, which keeps the counter and its
+    /// scale factor a single decision.
+    pub fn is_direct(&self) -> bool {
+        matches!(self.source, Source::SelfDescribing { .. })
+    }
+
     /// Raw counter reading. Ticks, not nanoseconds.
     #[inline]
     pub fn raw(&self) -> u64 {
@@ -141,8 +148,10 @@ fn self_describing_timebase() -> Option<(u64, u64)> {
     }
 }
 
-#[inline]
-fn read_counter() -> u64 {
+/// The counter behind a self-describing clock. Only valid when
+/// [`Clock::is_direct`] said so.
+#[inline(always)]
+pub fn read_counter() -> u64 {
     #[cfg(all(target_arch = "aarch64", not(target_os = "ios")))]
     {
         let ticks: u64;

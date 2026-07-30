@@ -8,7 +8,10 @@ use pyo3::prelude::*;
 use pyo3::types::PyType;
 use std::sync::Arc;
 use std::thread;
-use trace0_core::{Clock, CodeLookup, EventQueue, ThreadNames, run_pipeline, tls::CTX};
+use trace0_core::{
+    Clock, CodeLookup, EventQueue, ThreadNames, run_pipeline,
+    tls::{COLD, hot},
+};
 
 const DEFAULT_CAPACITY: usize = 1_000_000;
 
@@ -91,11 +94,11 @@ impl Tracer {
 
         monitoring::disable(py, &h.monitoring)?;
         // Drain the calling thread's partial batch (worker threads
-        // do this via PerThread::Drop on exit; the thread that runs
+        // do this via Cold::Drop on exit; the thread that runs
         // `stop` is still alive). Safe to touch its TLS now —
         // `monitoring::disable` returned so no callbacks fire here
         // anymore.
-        CTX.with_borrow_mut(|ctx| ctx.flush_partial());
+        COLD.with_borrow_mut(|cold| cold.flush_partial(hot()));
         h.queue.close();
 
         let join = h.exporter_thread.take();
