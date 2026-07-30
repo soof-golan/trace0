@@ -39,8 +39,8 @@ work. Reproduce with `scripts/bench_alternatives.py`:
 
 trace0 adds about a seventh of `cProfile`'s overhead *and* keeps every event,
 where `cProfile` only keeps per-function aggregates. That protobuf trace was
-210 MB — a full timeline is not free, it is just cheaper in time than in disk.
-The same run as JSON is 3 GB.
+197 MB — a full timeline is not free, it is just cheaper in time than in disk.
+The same run as JSON is an order of magnitude larger.
 
 For the callback in isolation, `scripts/bench_producer.py` reports the
 difference against the same workload untraced: **~4 ns per event at 8
