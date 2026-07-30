@@ -5,9 +5,89 @@ use trace0_core::{CodeInfo, CodeLookup, Event, Exporter, ThreadNames};
 
 pub struct JsonExporter<W: Write + Send> {
     out: W,
+    buf: Vec<u8>,
     first: bool,
     pid: u32,
-    codes: ahash::AHashMap<u32, CodeInfo>,
+    templates: ahash::AHashMap<u32, Template>,
+}
+
+struct Template {
+    head: Vec<u8>,
+    tail: Vec<u8>,
+}
+
+impl Template {
+    fn of(info: &CodeInfo) -> Self {
+        let mut head = Vec::new();
+        head.extend_from_slice(b"{\"name\":");
+        push_string(
+            &mut head,
+            if info.qualname.is_empty() {
+                "<unknown>"
+            } else {
+                &info.qualname
+            },
+        );
+        head.extend_from_slice(b",\"cat\":\"py\",\"ph\":\"");
+
+        let mut tail = Vec::new();
+        tail.extend_from_slice(b",\"args\":{\"file\":");
+        push_string(&mut tail, &info.filename);
+        tail.extend_from_slice(b",\"line\":");
+        push_u64(&mut tail, info.firstlineno as u64);
+        tail.extend_from_slice(b",\"kind\":\"");
+
+        Self { head, tail }
+    }
+}
+
+fn push_u64(out: &mut Vec<u8>, mut v: u64) {
+    let mut digits = [0u8; 20];
+    let mut n = 0;
+    loop {
+        digits[n] = b'0' + (v % 10) as u8;
+        v /= 10;
+        n += 1;
+        if v == 0 {
+            break;
+        }
+    }
+    while n > 0 {
+        n -= 1;
+        out.push(digits[n]);
+    }
+}
+
+fn push_micros(out: &mut Vec<u8>, ts_ns: u64) {
+    push_u64(out, ts_ns / 1_000);
+    let frac = ts_ns % 1_000;
+    out.push(b'.');
+    out.push(b'0' + (frac / 100) as u8);
+    out.push(b'0' + (frac / 10 % 10) as u8);
+    out.push(b'0' + (frac % 10) as u8);
+}
+
+fn push_string(out: &mut Vec<u8>, s: &str) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.push(b'"');
+    for b in s.bytes() {
+        match b {
+            b'"' => out.extend_from_slice(b"\\\""),
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            0x08 => out.extend_from_slice(b"\\b"),
+            0x09 => out.extend_from_slice(b"\\t"),
+            0x0a => out.extend_from_slice(b"\\n"),
+            0x0c => out.extend_from_slice(b"\\f"),
+            0x0d => out.extend_from_slice(b"\\r"),
+            0x00..=0x1f => {
+                out.extend_from_slice(b"\\u00");
+                out.push(HEX[(b >> 4) as usize]);
+                out.push(HEX[(b & 0x0f) as usize]);
+            }
+            _ => out.push(b),
+        }
+    }
+    out.push(b'"');
 }
 
 impl JsonExporter<BufWriter<File>> {
@@ -22,9 +102,10 @@ impl<W: Write + Send> JsonExporter<W> {
         out.write_all(b"{\"traceEvents\":[")?;
         Ok(Self {
             out,
+            buf: Vec::with_capacity(1 << 18),
             first: true,
             pid: std::process::id(),
-            codes: ahash::AHashMap::new(),
+            templates: ahash::AHashMap::new(),
         })
     }
 
@@ -49,30 +130,33 @@ impl<W: Write + Send> Exporter for JsonExporter<W> {
         codes: &dyn CodeLookup,
         _threads: &dyn ThreadNames,
     ) -> io::Result<()> {
+        self.buf.clear();
         for ev in events {
-            self.separator()?;
             let id = ev.code_id();
-            if !self.codes.contains_key(&id) {
-                self.codes.insert(id, codes.code(id).unwrap_or_default());
-            }
-            let info = &self.codes[&id];
+            let template = self
+                .templates
+                .entry(id)
+                .or_insert_with(|| Template::of(&codes.code(id).unwrap_or_default()));
             let kind = ev.kind();
-            let entry = serde_json::json!({
-                "name": if info.qualname.is_empty() { "<unknown>" } else { &info.qualname },
-                "cat": "py",
-                "ph": if kind.opens_slice() { "B" } else { "E" },
-                "ts": ev.ts_ns as f64 / 1000.0,
-                "pid": self.pid,
-                "tid": ev.tid,
-                "args": {
-                    "file": info.filename,
-                    "line": info.firstlineno,
-                    "kind": kind.as_str(),
-                }
-            });
-            serde_json::to_writer(&mut self.out, &entry)?;
+
+            if !self.first {
+                self.buf.push(b',');
+            }
+            self.first = false;
+
+            self.buf.extend_from_slice(&template.head);
+            self.buf.push(if kind.opens_slice() { b'B' } else { b'E' });
+            self.buf.extend_from_slice(b"\",\"ts\":");
+            push_micros(&mut self.buf, ev.ts_ns);
+            self.buf.extend_from_slice(b",\"pid\":");
+            push_u64(&mut self.buf, self.pid as u64);
+            self.buf.extend_from_slice(b",\"tid\":");
+            push_u64(&mut self.buf, ev.tid as u64);
+            self.buf.extend_from_slice(&template.tail);
+            self.buf.extend_from_slice(kind.as_str().as_bytes());
+            self.buf.extend_from_slice(b"\"}}");
         }
-        Ok(())
+        self.out.write_all(&self.buf)
     }
 
     fn finish(
@@ -236,6 +320,58 @@ mod tests {
                 (3, "cpu-b".into())
             ]
         );
+    }
+
+    #[test]
+    fn names_that_need_escaping_survive_the_writer() {
+        let mut t = CodeTable::new();
+        t.push(CodeInfo {
+            qualname: "say(\"hi\")\n\tand\\stop\u{1}\u{1f600}".into(),
+            filename: "C:\\tmp\\a\"b\r.py".into(),
+            firstlineno: 7,
+        });
+        let v = export(
+            &[Event::new(0, 1, 0, EventKind::Begin)],
+            &t,
+            &ThreadTable::new(),
+            0,
+        );
+        let ev = &v["traceEvents"][0];
+        assert_eq!(ev["name"], "say(\"hi\")\n\tand\\stop\u{1}\u{1f600}");
+        assert_eq!(ev["args"]["file"], "C:\\tmp\\a\"b\r.py");
+        assert_eq!(ev["args"]["line"], 7);
+    }
+
+    #[test]
+    fn timestamps_keep_nanosecond_precision() {
+        let events = [
+            Event::new(1_234_567, 1, 0, EventKind::Begin),
+            Event::new(1_234_568, 1, 0, EventKind::End),
+        ];
+        let v = export(&events, &fib_table(), &ThreadTable::new(), 0);
+        let ev = v["traceEvents"].as_array().unwrap();
+        assert_eq!(ev[0]["ts"].as_f64().unwrap(), 1234.567);
+        assert_eq!(ev[1]["ts"].as_f64().unwrap(), 1234.568);
+    }
+
+    #[test]
+    fn every_event_carries_the_full_chrome_trace_shape() {
+        let v = export(
+            &[Event::new(5_000, 3, 0, EventKind::Begin)],
+            &fib_table(),
+            &ThreadTable::new(),
+            0,
+        );
+        let ev = &v["traceEvents"][0];
+        let keys: Vec<&str> = ev.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        assert_eq!(keys, ["args", "cat", "name", "ph", "pid", "tid", "ts"]);
+        let args: Vec<&str> = ev["args"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        assert_eq!(args, ["file", "kind", "line"]);
     }
 
     #[test]
