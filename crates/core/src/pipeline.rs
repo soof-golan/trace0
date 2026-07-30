@@ -3,7 +3,6 @@ use crate::evqueue::EventQueue;
 use crate::sink::{CodeLookup, Exporter, ThreadNames};
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -17,16 +16,13 @@ pub fn run_pipeline(
     mut exporter: Box<dyn Exporter>,
 ) -> io::Result<()> {
     let (mut fanin_tx, mut fanin_rx) = rtrb::RingBuffer::<Event>::new(FANIN_CAPACITY);
-    let fanin_dropped = Arc::new(AtomicU64::new(0));
-    let fanin_closed = Arc::new(AtomicBool::new(false));
 
     let serializer = {
         let inbound = inbound.clone();
-        let fanin_dropped = fanin_dropped.clone();
-        let fanin_closed = fanin_closed.clone();
         thread::Builder::new()
             .name("trace0-serializer".into())
             .spawn(move || {
+                let mut dropped: u64 = 0;
                 let mut buf: Vec<Event> = Vec::with_capacity(BATCH);
                 let mut empty_spins: u32 = 0;
                 const SPIN_BEFORE_YIELD: u32 = 1024;
@@ -48,7 +44,7 @@ pub fn run_pipeline(
                     empty_spins = 0;
                     for ev in buf.drain(..) {
                         if fanin_tx.push(ev).is_err() {
-                            fanin_dropped.fetch_add(1, Ordering::Relaxed);
+                            dropped += 1;
                         }
                     }
                 }
@@ -59,11 +55,11 @@ pub fn run_pipeline(
                     }
                     for ev in buf.drain(..) {
                         if fanin_tx.push(ev).is_err() {
-                            fanin_dropped.fetch_add(1, Ordering::Relaxed);
+                            dropped += 1;
                         }
                     }
                 }
-                fanin_closed.store(true, Ordering::Release);
+                dropped
             })
             .map_err(io::Error::other)?
     };
@@ -81,7 +77,7 @@ pub fn run_pipeline(
             buf.clear();
             continue;
         }
-        if fanin_closed.load(Ordering::Acquire) {
+        if serializer.is_finished() {
             while let Ok(ev) = fanin_rx.pop() {
                 buf.push(ev);
             }
@@ -93,10 +89,143 @@ pub fn run_pipeline(
         thread::sleep(Duration::from_millis(5));
     }
 
-    serializer
+    let fanin_dropped = serializer
         .join()
         .map_err(|_| io::Error::other("serializer panicked"))?;
-    let total_dropped = inbound.dropped() + fanin_dropped.load(Ordering::Relaxed);
+    let total_dropped = inbound.dropped() + fanin_dropped;
     exporter.finish(codes.as_ref(), threads.as_ref(), total_dropped)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clock::Clock;
+    use crate::event::EventKind;
+    use crate::evqueue::{BATCH_N, BATCHES_CAPACITY};
+    use crate::sink::{CodeTable, ThreadTable};
+    use crate::tls::{COLD, hot};
+    use parking_lot::Mutex;
+    use std::time::Instant;
+
+    #[derive(Default)]
+    struct Recording {
+        events: Vec<Event>,
+        dropped: Option<u64>,
+    }
+
+    struct Collector(Arc<Mutex<Recording>>);
+
+    impl Exporter for Collector {
+        fn write_batch(
+            &mut self,
+            events: &[Event],
+            _: &dyn CodeLookup,
+            _: &dyn ThreadNames,
+        ) -> io::Result<()> {
+            self.0.lock().events.extend_from_slice(events);
+            Ok(())
+        }
+
+        fn finish(&mut self, _: &dyn CodeLookup, _: &dyn ThreadNames, dropped: u64) -> io::Result<()> {
+            self.0.lock().dropped = Some(dropped);
+            Ok(())
+        }
+    }
+
+    fn queue() -> Arc<EventQueue> {
+        Arc::new(EventQueue::new(Clock::mock().0))
+    }
+
+    fn produce(queue: &Arc<EventQueue>, n: u32) -> thread::JoinHandle<()> {
+        let queue = queue.clone();
+        thread::Builder::new()
+            .name("producer".into())
+            .spawn(move || {
+                let hot = hot();
+                for i in 0..n {
+                    queue.push_with_ctx(hot, queue.id(), i as u64, 7, i % 16, EventKind::Begin);
+                }
+                COLD.with_borrow_mut(|cold| cold.flush_partial(hot));
+            })
+            .unwrap()
+    }
+
+    fn drain(queue: Arc<EventQueue>, into: Arc<Mutex<Recording>>) {
+        run_pipeline(
+            queue,
+            Arc::new(CodeTable::new()),
+            Arc::new(ThreadTable::new()),
+            Box::new(Collector(into)),
+        )
+        .unwrap();
+    }
+
+    fn drain_all(queue: Arc<EventQueue>) -> Recording {
+        let seen = Arc::new(Mutex::new(Recording::default()));
+        drain(queue, seen.clone());
+        Arc::try_unwrap(seen).ok().unwrap().into_inner()
+    }
+
+    #[test]
+    fn every_event_survives_the_fanin() {
+        let queue = queue();
+        produce(&queue, 5000).join().unwrap();
+        queue.close();
+        let seen = drain_all(queue);
+        assert_eq!(seen.events.len(), 5000);
+        assert_eq!(seen.dropped, Some(0));
+    }
+
+    #[test]
+    fn events_pushed_while_the_exporter_runs_are_not_lost() {
+        let queue = queue();
+        let producer = produce(&queue, 20_000);
+        let closer = {
+            let queue = queue.clone();
+            thread::spawn(move || {
+                producer.join().unwrap();
+                queue.close();
+            })
+        };
+        let seen = drain_all(queue.clone());
+        closer.join().unwrap();
+        assert_eq!(seen.events.len() as u64 + queue.dropped(), 20_000);
+        assert_eq!(seen.dropped, Some(queue.dropped()));
+    }
+
+    #[test]
+    fn the_exporter_is_told_how_many_events_were_dropped() {
+        let queue = queue();
+        let n = ((BATCHES_CAPACITY + 8) * BATCH_N) as u32;
+        produce(&queue, n).join().unwrap();
+        queue.close();
+        let seen = drain_all(queue.clone());
+        assert!(queue.dropped() > 0, "a queue this small should have overflowed");
+        assert_eq!(seen.dropped, Some(queue.dropped()));
+        assert_eq!(seen.events.len(), BATCHES_CAPACITY * BATCH_N);
+    }
+
+    #[test]
+    fn the_exporter_writes_before_the_queue_closes() {
+        let queue = queue();
+        produce(&queue, 4096).join().unwrap();
+        let seen = Arc::new(Mutex::new(Recording::default()));
+        let pipeline = {
+            let queue = queue.clone();
+            let seen = seen.clone();
+            thread::spawn(move || drain(queue, seen))
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while seen.lock().events.is_empty() {
+            assert!(Instant::now() < deadline, "nothing was written before close");
+            thread::yield_now();
+        }
+        assert!(seen.lock().dropped.is_none(), "finish ran before close");
+
+        queue.close();
+        pipeline.join().unwrap();
+        assert_eq!(seen.lock().events.len(), 4096);
+    }
 }
