@@ -22,3 +22,6 @@ target/
 # Generated trace artifacts
 examples/*.json
 examples/*.pb
+
+# Worktrees created for isolated background agents
+.claude/worktrees/
