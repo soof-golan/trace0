@@ -8,7 +8,7 @@ class Tracer:
     def __init__(
         self,
         output: str,
-        format: TraceFormat = "json",
+        format: TraceFormat = "protobuf",
     ) -> None: ...
 
     def start(self) -> None: ...

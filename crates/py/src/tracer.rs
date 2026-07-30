@@ -33,7 +33,7 @@ impl Tracer {
     pub(crate) fn new(output: String, format: Option<String>) -> Self {
         Self {
             output,
-            format: format.unwrap_or_else(|| "json".to_string()),
+            format: format.unwrap_or_else(|| "protobuf".to_string()),
             handle: Mutex::new(None),
         }
     }
