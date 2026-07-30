@@ -67,6 +67,10 @@ pub struct ProtoExporter<W: Write + Send> {
     /// Interned name id per code object. Writing `Parser._parse_expression`
     /// into all ten million of its events is most of a trace's bytes.
     name_iids: ahash::AHashMap<u32, u64>,
+    /// Dense track uuids. The value is opaque to Perfetto, and a sparse
+    /// one like `0x7000_0000_0000_0000 | tid` costs a full 10-byte varint
+    /// on every event -- a third of the trace.
+    track_uuids: ahash::AHashMap<u32, u64>,
     seen_tids: ahash::AHashSet<u32>,
     process_emitted: bool,
     pid: i32,
@@ -88,6 +92,7 @@ impl<W: Write + Send> ProtoExporter<W> {
             templates: ahash::AHashMap::new(),
             template_bytes: Vec::with_capacity(1 << 12),
             name_iids: ahash::AHashMap::new(),
+            track_uuids: ahash::AHashMap::new(),
             seen_tids: ahash::AHashSet::new(),
             process_emitted: false,
             pid: std::process::id() as i32,
@@ -114,8 +119,6 @@ impl<W: Write + Send> ProtoExporter<W> {
         self.out.write_all(&self.scratch)
     }
 
-    /// Byte range in `template_bytes` holding the encoded `track_event`
-    /// field for this combination, building it on first sight.
     /// Interned id for this code object's name, emitting the name itself
     /// into the stream the first time it is seen.
     fn name_iid(&mut self, code_id: u32, codes: &dyn CodeLookup) -> io::Result<u64> {
@@ -154,12 +157,15 @@ impl<W: Write + Send> ProtoExporter<W> {
         opens: bool,
         codes: &dyn CodeLookup,
     ) -> io::Result<(u32, u32)> {
-        let key = ((tid as u64) << 32) | ((code_id as u64) << 1) | opens as u64;
+        // A slice end carries no name, so every end on a thread encodes
+        // identically and needs only one template.
+        let keyed_code = if opens { code_id } else { 0 };
+        let key = ((tid as u64) << 32) | ((keyed_code as u64) << 1) | opens as u64;
         if let Some(&range) = self.templates.get(&key) {
             return Ok(range);
         }
 
-        let name_iid = self.name_iid(code_id, codes)?;
+        let uuid = self.track_uuid(tid);
 
         let mut event = Vec::with_capacity(32);
         event.push(tag::TYPE);
@@ -169,11 +175,16 @@ impl<W: Write + Send> ProtoExporter<W> {
             pb::track_event::Type::SliceEnd as u8
         });
         event.push(tag::TRACK_UUID);
-        push_varint(&mut event, thread_uuid(tid));
-        event.push(tag::CATEGORY_IIDS);
-        push_varint(&mut event, CATEGORY_IID);
-        event.push(tag::NAME_IID);
-        push_varint(&mut event, name_iid);
+        push_varint(&mut event, uuid);
+        // A slice end closes whatever the track has open, so repeating the
+        // name and category on it is pure duplication.
+        if opens {
+            let name_iid = self.name_iid(code_id, codes)?;
+            event.push(tag::CATEGORY_IIDS);
+            push_varint(&mut event, CATEGORY_IID);
+            event.push(tag::NAME_IID);
+            push_varint(&mut event, name_iid);
+        }
 
         let start = self.template_bytes.len() as u32;
         self.template_bytes.push(tag::TRACK_EVENT);
@@ -225,7 +236,7 @@ impl<W: Write + Send> ProtoExporter<W> {
             }),
             data: Some(pb::trace_packet::Data::TrackDescriptor(
                 pb::TrackDescriptor {
-                    uuid: Some(process_uuid(pid)),
+                    uuid: Some(PROCESS_UUID),
                     name: Some(format!("python:{pid}")),
                     process: Some(pb::ProcessDescriptor {
                         pid: Some(pid),
@@ -238,10 +249,16 @@ impl<W: Write + Send> ProtoExporter<W> {
         self.write_packet(&pkt)
     }
 
+    fn track_uuid(&mut self, tid: u32) -> u64 {
+        let next = self.track_uuids.len() as u64 + PROCESS_UUID + 1;
+        *self.track_uuids.entry(tid).or_insert(next)
+    }
+
     fn ensure_thread(&mut self, tid: u32, threads: &dyn ThreadNames) -> io::Result<()> {
         if !self.seen_tids.insert(tid) {
             return Ok(());
         }
+        let uuid = self.track_uuid(tid);
         let pid = self.pid;
         let pkt = pb::TracePacket {
             timestamp: Some(0),
@@ -250,8 +267,8 @@ impl<W: Write + Send> ProtoExporter<W> {
             sequence_flags: None,
             data: Some(pb::trace_packet::Data::TrackDescriptor(
                 pb::TrackDescriptor {
-                    uuid: Some(thread_uuid(tid)),
-                    parent_uuid: Some(process_uuid(pid)),
+                    uuid: Some(uuid),
+                    parent_uuid: Some(PROCESS_UUID),
                     thread: Some(pb::ThreadDescriptor {
                         pid: Some(pid),
                         tid: Some(tid as i32),
@@ -287,13 +304,8 @@ fn put_varint(buf: &mut [u8], mut v: u64) -> usize {
     }
 }
 
-fn process_uuid(pid: i32) -> u64 {
-    0x5000_0000_0000_0000u64 | (pid as u32 as u64)
-}
-
-fn thread_uuid(tid: u32) -> u64 {
-    0x7000_0000_0000_0000u64 | (tid as u64)
-}
+/// Uuid 1 is the process; threads take 2 upward in first-seen order.
+const PROCESS_UUID: u64 = 1;
 
 impl<W: Write + Send> Exporter for ProtoExporter<W> {
     fn write_batch(
@@ -329,7 +341,7 @@ impl<W: Write + Send> Exporter for ProtoExporter<W> {
                 sequence_flags: None,
                 data: Some(pb::trace_packet::Data::TrackEvent(pb::TrackEvent {
                     r#type: Some(pb::track_event::Type::Instant as i32),
-                    track_uuid: Some(process_uuid(self.pid)),
+                    track_uuid: Some(PROCESS_UUID),
                     name: Some(format!("trace0: {dropped} events dropped")),
                     categories: vec!["py".into(), "dropped".into()],
                     category_iids: vec![],
@@ -480,9 +492,52 @@ mod tests {
         assert_eq!(names.len(), 2);
         let resolved: Vec<_> = track_events(&pkts)
             .iter()
+            .filter(|te| te.r#type == Some(pb::track_event::Type::SliceBegin as i32))
             .map(|te| names[&te.name_iid.unwrap()].clone())
             .collect();
-        assert_eq!(resolved, vec!["alpha", "beta", "alpha"]);
+        assert_eq!(resolved, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn slice_ends_carry_no_name_or_category() {
+        let raw = export(
+            &[
+                Event::new(0, 1, 0, EventKind::Begin),
+                Event::new(5, 1, 0, EventKind::End),
+            ],
+            &fib_table(),
+            &ThreadTable::new(),
+            0,
+        );
+        let pkts = packets(&raw);
+        let evs = track_events(&pkts);
+        let end = evs
+            .iter()
+            .find(|te| te.r#type == Some(pb::track_event::Type::SliceEnd as i32))
+            .expect("no slice end");
+        // The track already knows which slice is open; repeating its name
+        // on the end would be duplication on half of every trace.
+        assert_eq!(end.name_iid, None);
+        assert!(end.category_iids.is_empty());
+        assert!(end.track_uuid.is_some());
+    }
+
+    #[test]
+    fn track_uuids_stay_small_enough_to_encode_in_one_byte() {
+        let mut threads = ThreadTable::new();
+        threads.insert(4242, "worker");
+        let raw = export(
+            &[Event::new(0, 4242, 0, EventKind::Begin)],
+            &fib_table(),
+            &ThreadTable::new(),
+            0,
+        );
+        let pkts = packets(&raw);
+        for te in track_events(&pkts) {
+            let uuid = te.track_uuid.unwrap();
+            assert!(uuid < 128, "uuid {uuid} needs more than one varint byte");
+        }
+        let _ = threads;
     }
 
     #[test]

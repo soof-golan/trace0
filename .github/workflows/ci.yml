@@ -52,3 +52,26 @@ jobs:
       - uses: astral-sh/setup-uv@v7
       - name: Trace a real workload
         run: uv run --python ${{ matrix.python }} scripts/smoke.py
+
+  # The Rust tests decode our protobuf with prost, which only proves we can
+  # read back what we wrote. This runs Perfetto's own trace_processor, so
+  # the encoding tricks -- interning, bare slice ends, dense track uuids --
+  # are checked against the consumer that has to understand them.
+  perfetto:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+      # Not a free-threaded build: the perfetto package depends on
+      # protobuf, which does not publish 3.13t wheels.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v7
+      - name: Validate the trace with trace_processor
+        run: uv run --python 3.13 --with perfetto scripts/verify_perfetto.py
