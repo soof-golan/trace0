@@ -1,14 +1,9 @@
 name: Release
 
-# Tagging is the release trigger. `git tag v0.1.1 && git push --tags`
-# builds every wheel, publishes to PyPI, and cuts the GitHub Release.
 on:
   push:
     tags:
       - "v*"
-  # Dry run: builds and checks the whole matrix, publishes nothing. Use this
-  # to validate a matrix change, because a tag that fails after publishing
-  # burns its filenames on PyPI permanently.
   workflow_dispatch:
 
 permissions:
@@ -19,8 +14,6 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # A tag that disagrees with pyproject.toml would publish a version nobody
-  # can reproduce from the source tree. Catch it before anything is built.
   check-version:
     runs-on: ubuntu-latest
     steps:
@@ -33,9 +26,6 @@ jobs:
           echo "tag=$tag declared=$declared"
           [ "$tag" = "$declared" ]
 
-  # Native runners per architecture. Cross-compiling cannot work here: maturin
-  # introspects the target interpreter to build, and an aarch64 python inside
-  # an x86_64 container is an `Exec format error`.
   linux:
     needs: check-version
     runs-on: ${{ matrix.runner }}
@@ -45,9 +35,6 @@ jobs:
         runner: [ubuntu-22.04, ubuntu-24.04-arm]
     steps:
       - uses: actions/checkout@v6
-      # Interpreters are named by their absolute path in the manylinux image.
-      # There is deliberately no cp313t: manylinux ships no free-threaded 3.13,
-      # because that build was experimental until 3.14.
       - uses: PyO3/maturin-action@v1
         with:
           manylinux: auto
@@ -87,10 +74,6 @@ jobs:
         id: py
         with:
           python-version: ${{ matrix.python }}
-      # One interpreter per job, addressed by the exact path setup-python
-      # reports. Installing several at once and naming them on PATH does not
-      # work: the free-threaded builds live in PythonT.framework and shadow
-      # `python3.13`, so every name silently resolves to a free-threaded build.
       - uses: PyO3/maturin-action@v1
         with:
           args: >-
@@ -125,10 +108,7 @@ jobs:
       name: pypi
       url: https://pypi.org/p/trace0
     permissions:
-      # Trusted Publishing: PyPI verifies this workflow's identity directly,
-      # so there is no API token to store or to point at the wrong account.
       id-token: write
-      # Attaching the artifacts to the GitHub Release.
       contents: write
     steps:
       - uses: actions/download-artifact@v7
@@ -137,8 +117,6 @@ jobs:
           path: dist
           merge-multiple: true
       - uses: pypa/gh-action-pypi-publish@release/v1
-      # -R is required: this job never checks out, so gh has no git remote to
-      # infer the repository from.
       - name: Create the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}

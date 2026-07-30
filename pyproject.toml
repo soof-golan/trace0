@@ -19,7 +19,6 @@ Repository = "https://github.com/soof-golan/trace0"
 trace0 = "trace0.__main__:main"
 
 [tool.maturin]
-# Rust lives entirely under crates/, Python entirely under python/.
 manifest-path = "crates/py/Cargo.toml"
 module-name = "trace0._core"
 python-source = "python"

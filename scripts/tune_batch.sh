@@ -1,14 +1,4 @@
 #!/usr/bin/env bash
-# Sweep BATCH_N against the per-event overhead metric.
-#
-# BATCH_N sets how often the hot path falls into `slow_path`: once every
-# BATCH_N events a batch is shipped down the ring and a fresh one is
-# allocated, then freed later on the drain thread. Larger batches make
-# that rarer, at the cost of BATCHES_CAPACITY * BATCH_N * 8 bytes of
-# in-flight buffer per thread and a longer lag before events are visible.
-#
-# Run at 8 threads: cross-thread allocator traffic is what this tests,
-# and it does not exist at one thread.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

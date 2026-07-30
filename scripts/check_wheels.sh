@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
-# Assert every expected ABI tag produced a wheel.
-#
-# maturin's interpreter discovery can quietly build a subset — a green job
-# that ships fewer wheels than intended is worse than a red one, because it
-# is only noticed by the user whose install falls back to the sdist.
-#
-# Usage: check_wheels.sh <dist-dir> <abi-tag>...
 set -euo pipefail
+
+if [ $# -lt 2 ]; then
+    echo "usage: $0 <dist-dir> <abi-tag>..." >&2
+    exit 2
+fi
 
 dist=$1
 shift

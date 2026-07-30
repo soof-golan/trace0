@@ -14,9 +14,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # `cargo test` runs on the pyo3-free crates: the extension cdylib cannot be
-  # linked outside maturin, since `extension-module` deliberately leaves the
-  # CPython symbols undefined. clippy needs no linking, so it covers all four.
   rust:
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -31,10 +28,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test -p trace0-core -p trace0-json -p trace0-proto
+      - run: cargo test --workspace --exclude trace0-py
 
-  # Proves the extension still builds and traces on the interpreters the
-  # release matrix targets, before a tag makes it permanent.
   python:
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -55,10 +50,6 @@ jobs:
       - name: Invariants that need a live interpreter
         run: uv run --python ${{ matrix.python }} pytest
 
-  # The Rust tests decode our protobuf with prost, which only proves we can
-  # read back what we wrote. This runs Perfetto's own trace_processor, so
-  # the encoding tricks -- interning, bare slice ends, dense track uuids --
-  # are checked against the consumer that has to understand them.
   perfetto:
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -67,8 +58,6 @@ jobs:
         runner: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v6
-      # Not a free-threaded build: the perfetto package depends on
-      # protobuf, which does not publish 3.13t wheels.
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"

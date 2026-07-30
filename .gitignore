@@ -1,4 +1,3 @@
-# Python-generated files
 __pycache__/
 *.py[oc]
 build/
@@ -6,18 +5,13 @@ dist/
 wheels/
 *.egg-info
 
-# Virtual environments
 .venv
 .venv-*
 
-# uv lock — this is a library, downstreams pin themselves
 uv.lock
 
-# Rust build outputs
 target/
 
-# maturin develop drops compiled extensions next to the Python sources
 *.so
 
-# Worktrees created for isolated background agents
 .claude/worktrees/
