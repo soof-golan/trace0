@@ -103,11 +103,19 @@ yet stable and wheels are not yet built for every platform.
 
 ## Layout
 
+Rust lives under `crates/`, Python under `python/`.
+
 | crate | role |
 | --- | --- |
 | `trace0-core` | clock, event model, event queue, exporter contract |
 | `trace0-json` | Chrome Trace Event output |
 | `trace0-proto` | Perfetto protobuf output |
+| `trace0-py` | the `sys.monitoring` callbacks and the `_core` extension |
+
+Only `trace0-py` links against CPython, and it is the one crate with no
+tests: a cdylib built with `extension-module` leaves the interpreter's
+symbols undefined, so it cannot link outside maturin. Everything worth
+testing lives in the other three, which `cargo test` runs directly.
 
 ## License
 

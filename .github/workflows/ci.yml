@@ -14,9 +14,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # The `trace0` cdylib cannot be linked outside of maturin (it deliberately
-  # leaves the CPython symbols undefined), so the Rust suite runs on the three
-  # pyo3-free library crates.
+  # `cargo test` runs on the pyo3-free crates: the extension cdylib cannot be
+  # linked outside maturin, since `extension-module` deliberately leaves the
+  # CPython symbols undefined. clippy needs no linking, so it covers all four.
   rust:
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -30,7 +30,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
-      - run: cargo clippy -p trace0-core -p trace0-json -p trace0-proto -- -D warnings
+      - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test -p trace0-core -p trace0-json -p trace0-proto
 
   # Proves the extension still builds and traces on the interpreters the

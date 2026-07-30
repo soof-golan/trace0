@@ -1,0 +1,23 @@
+[package]
+name = "trace0-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The only crate that links against CPython, which is why it holds no
+# tests: a cdylib built with `extension-module` deliberately leaves the
+# interpreter's symbols undefined, so it cannot link outside maturin.
+# Everything testable lives in the other crates.
+[lib]
+name = "_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+trace0-core.workspace = true
+trace0-json.workspace = true
+trace0-proto.workspace = true
+ahash.workspace = true
+clap.workspace = true
+parking_lot.workspace = true
+pyo3.workspace = true

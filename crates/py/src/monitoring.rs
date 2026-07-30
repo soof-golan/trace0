@@ -79,7 +79,7 @@ fn fastcall_record(
         // event, several times what this callback's actual work costs.
         let py = unsafe { Python::assume_attached() };
         let cb_obj = unsafe { pyo3::Borrowed::<'_, '_, PyAny>::from_ptr(py, slf) };
-        let b = unsafe { cb_obj.downcast_unchecked::<Callbacks>() };
+        let b = unsafe { cb_obj.cast_unchecked::<Callbacks>() };
         let cb: &Callbacks = b.get();
         let code = unsafe { pyo3::Borrowed::<'_, '_, PyAny>::from_ptr(py, *args) };
         record(py, &cb.state, code, kind);

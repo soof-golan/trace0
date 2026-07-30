@@ -1,25 +1,6 @@
-[package]
-name = "trace0"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-repository.workspace = true
-
-[lib]
-name = "_core"
-crate-type = ["cdylib"]
-
-[dependencies]
-trace0-core.workspace = true
-trace0-json.workspace = true
-trace0-proto.workspace = true
-ahash.workspace = true
-clap.workspace = true
-parking_lot.workspace = true
-pyo3.workspace = true
-
 [workspace]
-members = ["crates/core", "crates/json", "crates/proto"]
+resolver = "3"
+members = ["crates/core", "crates/json", "crates/proto", "crates/py"]
 
 [workspace.package]
 version = "0.1.2"

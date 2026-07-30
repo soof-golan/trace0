@@ -60,7 +60,7 @@ fn run(py: Python<'_>, a: RunArgs) -> PyResult<i32> {
     let saved_argv: Py<PyAny> = sys.getattr("argv")?.unbind();
     let mut argv_items: Vec<String> = Vec::with_capacity(1 + a.script_args.len());
     argv_items.push(a.script.clone());
-    argv_items.extend(a.script_args.into_iter());
+    argv_items.extend(a.script_args);
     let new_argv = PyList::new(py, argv_items)?;
     sys.setattr("argv", &new_argv)?;
 

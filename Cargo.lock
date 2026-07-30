@@ -867,19 +867,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "trace0"
-version = "0.1.2"
-dependencies = [
- "ahash",
- "clap",
- "parking_lot",
- "pyo3",
- "trace0-core",
- "trace0-json",
- "trace0-proto",
-]
-
-[[package]]
 name = "trace0-core"
 version = "0.1.2"
 dependencies = [
@@ -908,6 +895,19 @@ dependencies = [
  "prost-build",
  "protox",
  "trace0-core",
+]
+
+[[package]]
+name = "trace0-py"
+version = "0.1.2"
+dependencies = [
+ "ahash",
+ "clap",
+ "parking_lot",
+ "pyo3",
+ "trace0-core",
+ "trace0-json",
+ "trace0-proto",
 ]
 
 [[package]]
