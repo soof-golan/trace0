@@ -1,13 +1,14 @@
-"""`Tracer` is configuration; `Tracer.start()` hands back a running
-`Session`. Splitting them removes the states a single object had to
-represent and reject: built but not started, started twice, stopped
-without starting.
+"""Tracing is a `with` block and nothing else.
 
-What remains is the interesting one. A second `Session` builds a fresh
-queue, interner and thread registry, but the threads that traced the
-first still hold the per-thread state it left behind: a write cursor
-into the old batch, a cached code id from the old numbering, and a
-thread already marked as named. Each of those was a shipped bug.
+There is no `start`/`stop` pair to call out of order, so a tracer that
+was never started, or started twice, or stopped without starting, cannot
+be reached from Python at all.
+
+What remains is the interesting case. A second run builds a fresh queue,
+interner and thread registry, but the threads that traced the first still
+hold the per-thread state it left behind: a write cursor into the old
+batch, a cached code id from the old numbering, and a thread already
+marked as named. Each of those was a shipped bug.
 """
 
 import json
@@ -49,25 +50,23 @@ def test_the_second_run_resolves_names_against_its_own_interner(traced):
     assert first == second
 
 
-def test_one_tracer_starts_as_many_sessions_as_asked(tmp_path):
-    """The config carries no run state, so it is reusable by construction."""
+def test_one_tracer_traces_as_many_times_as_asked(tmp_path):
+    """The tracer carries no run state between blocks, so it is reusable."""
     tracer = Tracer(str(tmp_path / "reused.json"), format="json")
     for _ in range(3):
-        session = tracer.start()
-        work()
-        session.stop()
+        with tracer:
+            work()
     assert phase(json.loads((tmp_path / "reused.json").read_text()), "B")
 
 
-def test_repeated_start_stop_cycles_stay_sound(tmp_path):
+def test_repeated_cycles_stay_sound(tmp_path):
     """PEP 669 does not promise zero callbacks after `set_events(0)`
     returns. A straggler on the stopping thread must land in a live batch
     rather than through the cursor of one already shipped."""
     for i in range(25):
         path = tmp_path / f"cycle{i}.json"
-        session = Tracer(str(path), format="json").start()
-        work()
-        session.stop()
+        with Tracer(str(path), format="json"):
+            work()
         assert json.loads(path.read_text())["droppedEvents"] == 0
 
 
@@ -78,28 +77,30 @@ def test_no_event_precedes_the_clock_anchor(traced):
     assert all(e["ts"] >= 0 for e in timed)
 
 
-def test_a_second_session_cannot_run_beside_the_first(tmp_path):
-    """sys.monitoring hands out one PROFILER_ID, so overlapping sessions
-    are refused by the interpreter rather than by us."""
-    session = Tracer(str(tmp_path / "a.json"), format="json").start()
-    try:
+def test_the_block_yields_the_tracer(tmp_path):
+    tracer = Tracer(str(tmp_path / "as.json"), format="json")
+    with tracer as entered:
+        pass
+    assert entered is tracer
+
+
+def test_a_second_tracer_cannot_run_inside_the_first(tmp_path):
+    """sys.monitoring hands out one PROFILER_ID, so overlapping runs are
+    refused by the interpreter rather than by us. The outer run survives
+    it."""
+    outer = tmp_path / "outer.json"
+    with Tracer(str(outer), format="json"):
         with pytest.raises(ValueError):
-            Tracer(str(tmp_path / "b.json"), format="json").start()
-    finally:
-        session.stop()
-
-
-def test_stopping_a_session_twice_is_harmless(tmp_path):
-    path = tmp_path / "twice.json"
-    session = Tracer(str(path), format="json").start()
-    work()
-    session.stop()
-    session.stop()
-    assert phase(json.loads(path.read_text()), "B")
-
-
-def test_the_session_is_the_context_manager(tmp_path):
-    path = tmp_path / "ctx.json"
-    with Tracer(str(path), format="json").start():
+            with Tracer(str(tmp_path / "inner.json"), format="json"):
+                pass
         work()
+    assert phase(json.loads(outer.read_text()), "B")
+
+
+def test_a_workload_that_raises_still_leaves_a_trace(tmp_path):
+    path = tmp_path / "raised.json"
+    with pytest.raises(ZeroDivisionError):
+        with Tracer(str(path), format="json"):
+            work()
+            1 / 0
     assert phase(json.loads(path.read_text()), "B")

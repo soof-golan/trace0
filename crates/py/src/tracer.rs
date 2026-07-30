@@ -13,7 +13,7 @@ use trace0_core::{
     tls::{COLD, hot},
 };
 
-struct Running {
+pub(crate) struct Running {
     queue: Arc<EventQueue>,
     monitoring: MonitoringHandle,
     exporter: thread::JoinHandle<std::io::Result<()>>,
@@ -23,20 +23,11 @@ struct Running {
 pub struct Tracer {
     output: String,
     format: Format,
+    running: Mutex<Option<Running>>,
 }
 
-#[pymethods]
 impl Tracer {
-    #[new]
-    #[pyo3(signature = (output, format = "protobuf".to_string()))]
-    pub(crate) fn new(output: String, format: String) -> PyResult<Self> {
-        Ok(Self {
-            output,
-            format: Format::parse(&format).map_err(PyValueError::new_err)?,
-        })
-    }
-
-    pub(crate) fn start(&self, py: Python<'_>) -> PyResult<Session> {
+    pub(crate) fn begin(&self, py: Python<'_>) -> PyResult<Running> {
         let queue = Arc::new(EventQueue::new(Clock::starting_now()));
         let state = Arc::new(State {
             run: queue.id(),
@@ -45,7 +36,7 @@ impl Tracer {
             threads: ThreadRegistry::new(),
         });
 
-        let exporter_sink = self
+        let sink = self
             .format
             .open(&self.output)
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
@@ -56,40 +47,25 @@ impl Tracer {
             let names: Arc<dyn ThreadNames> = state.clone();
             thread::Builder::new()
                 .name("trace0-exporter".into())
-                .spawn(move || run_pipeline(queue, codes, names, exporter_sink))
+                .spawn(move || run_pipeline(queue, codes, names, sink))
                 .map_err(|e| PyRuntimeError::new_err(format!("spawn exporter: {e}")))?
         };
 
-        let monitoring = match monitoring::enable(py, state) {
-            Ok(handle) => handle,
-            Err(e) => {
-                queue.close();
-                let _ = py.detach(move || exporter.join());
-                return Err(e);
-            }
-        };
-
-        Ok(Session {
-            running: Mutex::new(Some(Running {
+        match monitoring::enable(py, state) {
+            Ok(monitoring) => Ok(Running {
                 queue,
                 monitoring,
                 exporter,
-            })),
-        })
+            }),
+            Err(e) => {
+                queue.close();
+                let _ = py.detach(move || exporter.join());
+                Err(e)
+            }
+        }
     }
-}
 
-#[pyclass(module = "trace0._core", frozen)]
-pub struct Session {
-    running: Mutex<Option<Running>>,
-}
-
-#[pymethods]
-impl Session {
-    pub(crate) fn stop(&self, py: Python<'_>) -> PyResult<()> {
-        let Some(running) = self.running.lock().take() else {
-            return Ok(());
-        };
+    pub(crate) fn end(py: Python<'_>, running: Running) -> PyResult<()> {
         let Running {
             queue,
             monitoring,
@@ -108,9 +84,27 @@ impl Session {
             Err(_) => Err(PyRuntimeError::new_err("exporter thread panicked")),
         }
     }
+}
 
-    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
+#[pymethods]
+impl Tracer {
+    #[new]
+    #[pyo3(signature = (output, format = "protobuf".to_string()))]
+    pub(crate) fn new(output: String, format: String) -> PyResult<Self> {
+        Ok(Self {
+            output,
+            format: Format::parse(&format).map_err(PyValueError::new_err)?,
+            running: Mutex::new(None),
+        })
+    }
+
+    fn __enter__<'py>(slf: PyRef<'py, Self>, py: Python<'py>) -> PyResult<PyRef<'py, Self>> {
+        let running = slf.begin(py)?;
+        let mut slot = slf.running.lock();
+        debug_assert!(slot.is_none(), "__enter__ replaced a run still going");
+        *slot = Some(running);
+        drop(slot);
+        Ok(slf)
     }
 
     fn __exit__(
@@ -120,7 +114,10 @@ impl Session {
         _exc_val: Option<Bound<'_, pyo3::types::PyAny>>,
         _exc_tb: Option<Bound<'_, pyo3::types::PyAny>>,
     ) -> PyResult<bool> {
-        self.stop(py)?;
+        match self.running.lock().take() {
+            Some(running) => Tracer::end(py, running)?,
+            None => return Err(PyRuntimeError::new_err("tracer is not tracing")),
+        }
         Ok(false)
     }
 }

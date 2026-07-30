@@ -40,15 +40,14 @@ def worker() -> None:
 
 def record(path: Path) -> float:
     threads = [threading.Thread(target=worker, name=f"w{i}") for i in range(WORKERS)]
-    session = Tracer(str(path), format="protobuf").start()
-    started = time.perf_counter()
-    for t in threads:
-        t.start()
-    fib(DEPTH)
-    for t in threads:
-        t.join()
-    wall = time.perf_counter() - started
-    session.stop()
+    with Tracer(str(path), format="protobuf"):
+        started = time.perf_counter()
+        for t in threads:
+            t.start()
+        fib(DEPTH)
+        for t in threads:
+            t.join()
+        wall = time.perf_counter() - started
     return wall
 
 

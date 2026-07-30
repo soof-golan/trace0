@@ -40,11 +40,10 @@ def timed(traced: bool) -> float:
         start = time.perf_counter()
         workload()
         return time.perf_counter() - start
-    session = Tracer("/dev/null", format="protobuf").start()
-    start = time.perf_counter()
-    workload()
-    elapsed = time.perf_counter() - start
-    session.stop()
+    with Tracer("/dev/null", format="protobuf"):
+        start = time.perf_counter()
+        workload()
+        elapsed = time.perf_counter() - start
     return elapsed
 
 

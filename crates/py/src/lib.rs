@@ -10,7 +10,6 @@ mod tracer;
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<tracer::Tracer>()?;
-    m.add_class::<tracer::Session>()?;
     m.add_function(wrap_pyfunction!(cli::cli_main, m)?)?;
     Ok(())
 }

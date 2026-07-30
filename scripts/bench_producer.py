@@ -44,9 +44,8 @@ def time_threads(n_threads: int) -> float:
 
 
 def one_traced(n_threads: int) -> float:
-    session = Tracer("/dev/null", format="protobuf").start()
-    elapsed = time_threads(n_threads)
-    session.stop()
+    with Tracer("/dev/null", format="protobuf"):
+        elapsed = time_threads(n_threads)
     return elapsed
 
 

@@ -83,7 +83,7 @@ target.
 ```python
 from trace0 import Tracer
 
-with Tracer("trace.pb").start():
+with Tracer("trace.pb"):
     your_workload()
 ```
 

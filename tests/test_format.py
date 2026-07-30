@@ -18,7 +18,7 @@ def work() -> None:
 
 
 def trace_to(path, **kwargs) -> None:
-    with Tracer(str(path), **kwargs).start():
+    with Tracer(str(path), **kwargs):
         work()
 
 
