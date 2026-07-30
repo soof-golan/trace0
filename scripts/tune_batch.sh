@@ -1,18 +1,34 @@
 #!/usr/bin/env bash
-# Sweep BATCH_N and rebuild + bench at threads=1 and threads=4.
-set -e
+# Sweep BATCH_N against the per-event overhead metric.
+#
+# BATCH_N sets how often the hot path falls into `slow_path`: once every
+# BATCH_N events a batch is shipped down the ring and a fresh one is
+# allocated, then freed later on the drain thread. Larger batches make
+# that rarer, at the cost of BATCHES_CAPACITY * BATCH_N * 8 bytes of
+# in-flight buffer per thread and a longer lag before events are visible.
+#
+# Run at 8 threads: cross-thread allocator traffic is what this tests,
+# and it does not exist at one thread.
+set -euo pipefail
 cd "$(dirname "$0")/.."
 
-sizes=(64 256 1024 4096 16384)
-for n in "${sizes[@]}"; do
-    sed -i '' "s/pub const BATCH_N: usize = [0-9]*;/pub const BATCH_N: usize = ${n};/" crates/core/src/evqueue.rs
-    uv run --with maturin maturin develop --release 2>&1 | tail -1 > /dev/null
-    echo "=== BATCH_N=${n} ==="
-    echo "-- threads=1 --"
-    uv run python examples/bench_realistic.py --threads 1 --iters 10 --requests 10000 2>&1 | tail -3 | head -2
-    echo "-- threads=4 --"
-    uv run python examples/bench_realistic.py --threads 4 --iters 10 --requests 10000 2>&1 | tail -3 | head -2
-done
+RUNS=${RUNS:-3}
+THREADS=${THREADS:-8}
+read -r -a sizes <<<"${SIZES:-1024 4096 16384}"
 
-sed -i '' "s/pub const BATCH_N: usize = [0-9]*;/pub const BATCH_N: usize = 1024;/" crates/core/src/evqueue.rs
-uv run --with maturin maturin develop --release 2>&1 | tail -1 > /dev/null
+build_with() {
+    sed -i '' "s/pub const BATCH_N: usize = [0-9]*;/pub const BATCH_N: usize = ${1};/" \
+        crates/core/src/evqueue.rs
+    uv run --with maturin maturin develop --release >/dev/null 2>&1
+}
+
+trap 'git checkout -- crates/core/src/evqueue.rs' EXIT
+
+for n in "${sizes[@]}"; do
+    build_with "$n"
+    printf '=== BATCH_N=%-6s %2d KiB/batch, %2d MiB/thread in flight ===\n' \
+        "$n" "$((n * 8 / 1024))" "$((n * 8 * 64 / 1048576))"
+    for _ in $(seq "$RUNS"); do
+        uv run scripts/bench_producer.py "$THREADS" | tail -3 | head -1
+    done
+done
