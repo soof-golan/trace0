@@ -85,21 +85,47 @@ def check_worker_threads_are_named(events: list[dict]) -> None:
     assert not missing, f"unnamed worker threads: {missing} (saw {names})"
 
 
-def main() -> None:
-    with tempfile.TemporaryDirectory() as d:
-        trace, wall = trace_to(Path(d) / "smoke.json")
+def threads_with_slices(events: list[dict]) -> set[str]:
+    named = {e["tid"]: e["args"]["name"] for e in events if e["ph"] == "M"}
+    sliced = {e["tid"] for e in events if e["ph"] == "B"}
+    return {named.get(tid, str(tid)) for tid in sliced}
 
+
+def check(trace: dict, wall: float, run: int) -> int:
     events = trace["traceEvents"]
-    assert events, "traced a real workload but got no events"
-    assert trace["droppedEvents"] == 0, f"dropped {trace['droppedEvents']} events"
+    assert events, f"run {run}: traced a real workload but got no events"
+    assert trace["droppedEvents"] == 0, (
+        f"run {run}: dropped {trace['droppedEvents']} events"
+    )
 
     check_slices_are_balanced(events)
     check_durations_are_wall_clock(events, wall)
     check_worker_threads_are_named(events)
+    return len(events)
 
+
+def main() -> None:
+    # Traced twice on purpose. A second Tracer builds a fresh queue, but
+    # the thread that calls it is still carrying the recording state the
+    # first run left behind -- a stale cursor into the first run's batch.
+    #
+    # Compared by thread rather than by event count: the worker threads
+    # are new each run and record correctly either way, so a run that
+    # has silently lost everything the calling thread did still looks
+    # like a mostly-populated trace.
+    counts, threads = [], []
+    with tempfile.TemporaryDirectory() as d:
+        for run in (1, 2):
+            trace, wall = trace_to(Path(d) / f"smoke{run}.json")
+            counts.append(check(trace, wall, run))
+            threads.append(threads_with_slices(trace["traceEvents"]))
+
+    assert threads[0] == threads[1], (
+        f"threads recorded in run 1 but not run 2: {threads[0] - threads[1]}"
+    )
     print(
-        f"ok: {len(events)} events, {trace['droppedEvents']} dropped, "
-        f"{wall * 1000:.1f}ms traced"
+        f"ok: {counts[0]} then {counts[1]} events across two tracer runs, "
+        f"{len(threads[0])} threads in both"
     )
 
 

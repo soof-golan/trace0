@@ -58,6 +58,7 @@ impl Tracer {
         let interner = Arc::new(Interner::new());
         let threads = Arc::new(ThreadRegistry::new());
         let state = Arc::new(State {
+            run: queue.id(),
             queue: queue.clone(),
             interner: interner.clone(),
             threads: threads.clone(),

@@ -10,6 +10,9 @@ use trace0_core::event::{EventKind, os_tid};
 use trace0_core::{EventQueue, tls::hot};
 
 pub struct State {
+    /// `queue.id()`, copied here because this struct is on the hot path
+    /// and the queue's own cache line is not.
+    pub run: u64,
     pub queue: Arc<EventQueue>,
     pub interner: Arc<Interner>,
     pub threads: Arc<ThreadRegistry>,
@@ -33,6 +36,13 @@ fn resolve_cold(
     key: usize,
     hot: &mut trace0_core::tls::Hot,
 ) -> Option<u32> {
+    // Everything this thread learned belongs to whichever run taught it.
+    // A restarted tracer has a fresh interner numbering from zero and a
+    // fresh registry that has never heard of this thread.
+    if hot.queue_id != state.run {
+        hot.last_code_key = trace0_core::tls::NOT_CACHED;
+        hot.ensured = false;
+    }
     if hot.tid == u32::MAX {
         hot.tid = os_tid();
     }
@@ -70,9 +80,10 @@ fn record(py: Python<'_>, state: &State, code: pyo3::Borrowed<'_, '_, PyAny>, ki
     } else {
         state.queue.clock().raw()
     };
-    // One compare covers everything a settled thread has already done:
-    // same code object as last time, id assigned, thread named.
-    let code_id = if hot.last_code_key == key {
+    // Two compares cover everything a settled thread has already done:
+    // same code object as last time, id assigned, thread named, and all
+    // of it learned during *this* tracer run rather than a previous one.
+    let code_id = if hot.last_code_key == key && hot.queue_id == state.run {
         hot.last_code_id
     } else {
         match resolve_cold(py, state, code, key, hot) {
@@ -82,7 +93,7 @@ fn record(py: Python<'_>, state: &State, code: pyo3::Borrowed<'_, '_, PyAny>, ki
     };
     state
         .queue
-        .push_with_ctx(hot, ticks, hot.tid, code_id, kind);
+        .push_with_ctx(hot, state.run, ticks, hot.tid, code_id, kind);
 }
 
 #[pyclass(module = "trace0._core", frozen)]

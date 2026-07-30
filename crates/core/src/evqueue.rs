@@ -42,6 +42,11 @@ impl EventBatch {
 /// BATCH_N events. Raw ticks go in; the `Clock` converts to
 /// nanoseconds on the way out.
 pub struct EventQueue {
+    /// Distinguishes this queue from every other one the process has
+    /// built. A counter rather than the queue's address: stopping a
+    /// tracer frees its queue, and the next one is very likely to be
+    /// handed the same address back.
+    id: u64,
     clock: Clock,
     consumers: Mutex<Vec<Consumer<Box<EventBatch>>>>,
     dropped: AtomicU64,
@@ -50,9 +55,13 @@ pub struct EventQueue {
     wake_cv: Condvar,
 }
 
+/// Zero is reserved for "no queue", the state every thread starts in.
+static NEXT_QUEUE_ID: AtomicU64 = AtomicU64::new(1);
+
 impl EventQueue {
     pub fn new(clock: Clock) -> Self {
         Self {
+            id: NEXT_QUEUE_ID.fetch_add(1, Ordering::Relaxed),
             clock,
             consumers: Mutex::new(Vec::new()),
             dropped: AtomicU64::new(0),
@@ -66,6 +75,14 @@ impl EventQueue {
         &self.clock
     }
 
+    /// Identifies the tracer run this queue belongs to. Per-thread state
+    /// resolved against a previous run -- code ids, thread names, the
+    /// write cursor -- is meaningless to this one.
+    #[inline]
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
     /// Push into this thread's current batch.
     /// Computes the per-batch tick delta inline; force-closes the batch
     /// on rare > u32::MAX-tick gaps so deltas always fit in u32.
@@ -73,6 +90,7 @@ impl EventQueue {
     pub fn push_with_ctx(
         &self,
         hot: &mut Hot,
+        run: u64,
         ticks: u64,
         tid: u32,
         code_id: u32,
@@ -81,8 +99,17 @@ impl EventQueue {
         let code_kind = pack_code_kind(code_id, kind);
         let delta = ticks.wrapping_sub(hot.base_ticks);
         // One branch covers every case the hot path does not handle: no
-        // batch yet (null cursor), batch full, or a delta too wide for u32.
-        if hot.cursor < hot.end && delta <= DELTA_OVERFLOW {
+        // batch yet (null cursor), batch full, a delta too wide for u32,
+        // or a cursor left over from a previous tracer run -- which
+        // still addresses live memory, so nothing here would fault; the
+        // events would just be shipped to a ring nobody drains.
+        //
+        // `run` is [`Self::id`], taken as an argument rather than read
+        // back off `self`: the queue's own cache line is otherwise never
+        // touched on this path, and pulling it in costs more than the
+        // compare it feeds. A caller that passes the wrong one gets the
+        // slow path on every event, not a wrong trace.
+        if hot.cursor < hot.end && hot.queue_id == run && delta <= DELTA_OVERFLOW {
             // SAFETY: `cursor` is below `end`, so it addresses a slot
             // inside the current batch's buffer.
             unsafe {
@@ -102,8 +129,9 @@ impl EventQueue {
     fn init_producer(&self, cold: &mut Cold, hot: &mut Hot, ticks: u64, tid: u32) {
         let (prod, cons) = RingBuffer::<Box<EventBatch>>::new(BATCHES_CAPACITY);
         self.consumers.lock().push(cons);
-        cold.producer = Some((self as *const _ as usize, prod));
+        cold.producer = Some((self.id, prod));
         cold.batch = Some(Box::new(EventBatch::with_capacity(BATCH_N, ticks, tid)));
+        hot.queue_id = self.id;
         hot.clock_direct = self.clock.is_direct();
         cold.arm(hot);
     }
@@ -115,11 +143,10 @@ impl EventQueue {
     #[cold]
     #[inline(never)]
     fn slow_path(&self, hot: &mut Hot, ticks: u64, tid: u32, code_kind: u32) {
-        let q_id = self as *const _ as usize;
         COLD.with(|cold| {
             let cold = &mut *cold.borrow_mut();
             let stale = match &cold.producer {
-                Some((id, _)) => *id != q_id,
+                Some((id, _)) => *id != self.id,
                 None => true,
             };
             if stale {
@@ -253,7 +280,7 @@ mod tests {
             let q = EventQueue::new(clock);
             let hot = hot();
             for (ticks, tid, code, kind) in pushes {
-                q.push_with_ctx(hot, ticks, tid, code, kind);
+                q.push_with_ctx(hot, q.id(), ticks, tid, code, kind);
             }
             COLD.with_borrow_mut(|cold| cold.flush_partial(hot));
             let mut out = Vec::new();
@@ -262,6 +289,34 @@ mod tests {
         })
         .join()
         .unwrap()
+    }
+
+    /// A `Tracer` started, stopped and started again builds a second
+    /// queue, but the thread that traced the first run still holds a
+    /// cursor into the first queue's batch. Events written through it
+    /// are shipped to a ring nobody is draining any more.
+    #[test]
+    fn a_second_queue_on_the_same_thread_records_its_own_events() {
+        let out = std::thread::spawn(|| {
+            let hot = hot();
+            let first = EventQueue::new(test_clock());
+            first.push_with_ctx(hot, first.id(), 10, 1, 7, EventKind::Begin);
+            COLD.with_borrow_mut(|cold| cold.flush_partial(hot));
+            let mut discard = Vec::new();
+            first.drain_nonblocking(&mut discard, usize::MAX);
+            first.close();
+
+            let second = EventQueue::new(test_clock());
+            second.push_with_ctx(hot, second.id(), 20, 1, 7, EventKind::End);
+            COLD.with_borrow_mut(|cold| cold.flush_partial(hot));
+            let mut out = Vec::new();
+            second.drain_nonblocking(&mut out, usize::MAX);
+            out
+        })
+        .join()
+        .unwrap();
+        assert_eq!(out.len(), 1, "the second queue saw none of its own events");
+        assert_eq!(out[0].kind(), EventKind::End);
     }
 
     #[test]

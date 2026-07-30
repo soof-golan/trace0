@@ -38,6 +38,11 @@ pub struct Hot {
     pub end: *mut PackedEvent,
     /// Anchor the current batch's deltas are measured from.
     pub base_ticks: u64,
+    /// Which queue `cursor` points into. A tracer that is stopped and
+    /// started again leaves this thread holding a cursor into the old
+    /// run's batch; without this the events would be written and then
+    /// shipped to a ring the new run never drains.
+    pub queue_id: u64,
     /// Whether the counter can be read inline. Set from the queue's own
     /// clock, so it stays a decision that clock made -- not a second
     /// opinion about which counter to read.
@@ -58,6 +63,7 @@ impl Hot {
         cursor: std::ptr::null_mut(),
         end: std::ptr::null_mut(),
         base_ticks: 0,
+        queue_id: 0,
         clock_direct: false,
         last_code_key: NOT_CACHED,
         last_code_id: u32::MAX,
@@ -70,7 +76,7 @@ impl Hot {
 /// Owns heap memory and the ring producer, which is why it lives apart
 /// from [`Hot`].
 pub struct Cold {
-    pub producer: Option<(usize, Producer<Box<EventBatch>>)>,
+    pub producer: Option<(u64, Producer<Box<EventBatch>>)>,
     pub batch: Option<Box<EventBatch>>,
 }
 
