@@ -6,8 +6,8 @@ best case, and it hides the cost of resolving a code object entirely.
 
 This is the other end: enough distinct functions, called round-robin,
 that the cached entry misses every single time. Together the two bracket
-what any real program pays -- real code sits somewhere between, and where
-it sits is a property of the program, not of the tracer.
+what a real program pays, and where inside that range it lands is a
+property of the program rather than of the tracer.
 """
 
 import sys
@@ -20,8 +20,7 @@ ROUNDS = 20_000
 REPS = 7
 EVENTS = 2 * N_FUNCS * ROUNDS
 
-# Built by exec so each one is a genuinely distinct code object; 64
-# copies of the same source would share one.
+# exec only to avoid writing 64 near-identical defs out by hand.
 _defs: dict[str, object] = {}
 for _i in range(N_FUNCS):
     exec(f"def f{_i}(): pass", _defs)

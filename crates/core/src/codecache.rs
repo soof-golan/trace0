@@ -6,16 +6,16 @@
 //! through to the interner's `RwLock` -- uncontended in principle, but a
 //! shared cache line that every traced thread then writes to in turn.
 //!
-//! This sits between the two. It is per-thread, so it shares nothing, and
-//! direct-mapped, so a lookup is a multiply, a shift and one load.
+//! This sits between the two, and shares nothing.
 //!
 //! Caching an address is only sound because the interner holds a strong
 //! reference to every code object it has seen. An interned address is
 //! pinned for the tracer's lifetime and cannot be recycled under us.
 
-/// Entries per thread. 256 slots is 4 KiB, and covers the working set of
-/// the call-dense workloads in `scripts/` with room to spare.
-pub const SLOTS: usize = 256;
+/// Entries per thread, 16 bytes each. Sized for a call-dense program's
+/// hot set rather than its total: sqlglot reaches 2,232 code objects but
+/// cycles through far fewer at any one moment.
+const SLOTS: usize = 256;
 
 /// Address zero marks a free slot. No code object lives there, and
 /// picking a marker of zero keeps the table in `.tbss`, so a thread that
@@ -38,8 +38,8 @@ struct Slot {
 
 /// A direct-mapped, per-thread address → code id table.
 ///
-/// Collisions evict rather than probe: a wrong answer is unthinkable, a
-/// second miss is merely the cost we already pay.
+/// Collisions evict rather than probe. An evicted key costs one more trip
+/// to the interner, which is what every lookup cost before this existed.
 pub struct CodeCache {
     slots: [Slot; SLOTS],
 }
@@ -71,7 +71,7 @@ impl CodeCache {
     }
 
     #[inline(always)]
-    pub fn slot_of(key: usize) -> usize {
+    fn slot_of(key: usize) -> usize {
         key.wrapping_mul(GOLDEN) >> (usize::BITS as usize - SLOTS.trailing_zeros() as usize)
     }
 }

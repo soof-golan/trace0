@@ -105,14 +105,14 @@ def check(trace: dict, wall: float, run: int) -> int:
 
 
 def main() -> None:
-    # Traced twice on purpose. A second Tracer builds a fresh queue, but
-    # the thread that calls it is still carrying the recording state the
-    # first run left behind -- a stale cursor into the first run's batch.
+    # Traced twice on purpose: a second Tracer builds a fresh queue, but
+    # the thread that calls it still carries the recording state the first
+    # run left behind.
     #
-    # Compared by thread rather than by event count: the worker threads
-    # are new each run and record correctly either way, so a run that
-    # has silently lost everything the calling thread did still looks
-    # like a mostly-populated trace.
+    # Compared by thread rather than by event count. The worker threads are
+    # new each run and record correctly either way, so a run that has
+    # silently lost everything the calling thread did still looks like a
+    # mostly-populated trace -- which is how this went unnoticed before.
     counts, threads = [], []
     with tempfile.TemporaryDirectory() as d:
         for run in (1, 2):

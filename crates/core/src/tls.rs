@@ -182,10 +182,10 @@ pub fn hot() -> &'static mut Hot {
 /// This thread's code-object cache, consulted when [`Hot::last_code_key`]
 /// misses.
 ///
-/// Deliberately a separate slot rather than a field of [`Hot`]: the table
-/// is 4 KiB, and folding it in would put a second cache line on the path
-/// of every event, including the ones that hit the single cached entry
-/// and never look at the table at all.
+/// A separate slot rather than a field of [`Hot`]: the table is 4 KiB, and
+/// folding it in would put a second cache line on the path of every event,
+/// including the ones that hit the single cached entry and never read the
+/// table at all.
 ///
 /// # Safety
 ///

@@ -9,7 +9,6 @@ class Tracer:
         self,
         output: str,
         format: TraceFormat = "json",
-        capacity: Optional[int] = None,
     ) -> None: ...
 
     def start(self) -> None: ...

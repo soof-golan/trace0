@@ -13,8 +13,6 @@ use trace0_core::{
     tls::{COLD, hot},
 };
 
-const DEFAULT_CAPACITY: usize = 1_000_000;
-
 struct RunningHandle {
     queue: Arc<EventQueue>,
     monitoring: MonitoringHandle,
@@ -25,23 +23,17 @@ struct RunningHandle {
 pub struct Tracer {
     output: String,
     format: String,
-    /// Accepted for API compatibility. Ring sizing is currently fixed at
-    /// BATCH_N * BATCHES_CAPACITY per thread; wiring this through is a
-    /// separate change.
-    #[allow(dead_code)]
-    capacity: usize,
     handle: Mutex<Option<RunningHandle>>,
 }
 
 #[pymethods]
 impl Tracer {
     #[new]
-    #[pyo3(signature = (output, format = None, capacity = None))]
-    pub(crate) fn new(output: String, format: Option<String>, capacity: Option<usize>) -> Self {
+    #[pyo3(signature = (output, format = None))]
+    pub(crate) fn new(output: String, format: Option<String>) -> Self {
         Self {
             output,
             format: format.unwrap_or_else(|| "json".to_string()),
-            capacity: capacity.unwrap_or(DEFAULT_CAPACITY),
             handle: Mutex::new(None),
         }
     }

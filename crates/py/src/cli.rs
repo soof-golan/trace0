@@ -28,9 +28,6 @@ struct RunArgs {
     /// Output format.
     #[arg(short, long, value_enum, default_value_t = Format::Json)]
     format: Format,
-    /// Event queue capacity (events).
-    #[arg(short, long)]
-    capacity: Option<usize>,
     /// Python script to run.
     script: String,
     /// Arguments forwarded to the script.
@@ -54,7 +51,7 @@ pub fn cli_main(py: Python<'_>, argv: Vec<String>) -> PyResult<i32> {
 }
 
 fn run(py: Python<'_>, a: RunArgs) -> PyResult<i32> {
-    let tracer = Tracer::new(a.output, Some(a.format.as_str().to_string()), a.capacity);
+    let tracer = Tracer::new(a.output, Some(a.format.as_str().to_string()));
 
     let sys = py.import("sys")?;
     let saved_argv: Py<PyAny> = sys.getattr("argv")?.unbind();

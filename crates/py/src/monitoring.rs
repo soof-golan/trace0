@@ -14,8 +14,8 @@ use trace0_core::{
 };
 
 pub struct State {
-    /// `queue.id()`, copied here because this struct is on the hot path
-    /// and the queue's own cache line is not.
+    /// `queue.id()`, kept off the queue's own cache line -- see
+    /// [`EventQueue::push_with_ctx`].
     pub run: u64,
     pub queue: Arc<EventQueue>,
     pub interner: Arc<Interner>,
@@ -57,10 +57,7 @@ fn resolve_cold(
     if !hot.ensured {
         hot.ensured = state.threads.ensure(py, hot.tid);
     }
-    // The interner is shared, so a miss here is a lock every traced
-    // thread queues behind. `codes()` is this thread's alone.
-    //
-    // Never held across the Python calls above or below: a callback that
+    // Never held across the Python calls around it: a callback that
     // re-entered would alias it.
     let id = match codes().get(key) {
         Some(id) => id,
