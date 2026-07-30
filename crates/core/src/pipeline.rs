@@ -127,7 +127,12 @@ mod tests {
             Ok(())
         }
 
-        fn finish(&mut self, _: &dyn CodeLookup, _: &dyn ThreadNames, dropped: u64) -> io::Result<()> {
+        fn finish(
+            &mut self,
+            _: &dyn CodeLookup,
+            _: &dyn ThreadNames,
+            dropped: u64,
+        ) -> io::Result<()> {
             self.0.lock().dropped = Some(dropped);
             Ok(())
         }
@@ -146,7 +151,7 @@ mod tests {
                 for i in 0..n {
                     queue.push_with_ctx(hot, queue.id(), i as u64, 7, i % 16, EventKind::Begin);
                 }
-                COLD.with_borrow_mut(|cold| cold.flush_partial(hot));
+                queue.record_dropped(COLD.with_borrow_mut(|cold| cold.flush_partial(hot)));
             })
             .unwrap()
     }
@@ -201,9 +206,12 @@ mod tests {
         produce(&queue, n).join().unwrap();
         queue.close();
         let seen = drain_all(queue.clone());
-        assert!(queue.dropped() > 0, "a queue this small should have overflowed");
+        assert!(
+            queue.dropped() > 0,
+            "a queue this small should have overflowed"
+        );
         assert_eq!(seen.dropped, Some(queue.dropped()));
-        assert_eq!(seen.events.len(), BATCHES_CAPACITY * BATCH_N);
+        assert_eq!(seen.events.len() as u64 + queue.dropped(), n as u64);
     }
 
     #[test]
@@ -219,7 +227,10 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while seen.lock().events.is_empty() {
-            assert!(Instant::now() < deadline, "nothing was written before close");
+            assert!(
+                Instant::now() < deadline,
+                "nothing was written before close"
+            );
             thread::yield_now();
         }
         assert!(seen.lock().dropped.is_none(), "finish ran before close");

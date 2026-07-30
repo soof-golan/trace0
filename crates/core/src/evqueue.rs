@@ -211,6 +211,10 @@ impl EventQueue {
         self.dropped.load(Ordering::Relaxed)
     }
 
+    pub fn record_dropped(&self, events: u64) {
+        self.dropped.fetch_add(events, Ordering::Relaxed);
+    }
+
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
         let _g = self.wake_lock.lock();
@@ -302,6 +306,30 @@ mod tests {
         assert_eq!(out.len(), 4);
         assert_eq!(out[3].ts_ns, 3_000);
         assert_eq!(out[3].code_id(), 3);
+    }
+
+    #[test]
+    fn the_last_batch_is_counted_when_the_ring_has_no_room() {
+        let n = BATCH_N * (BATCHES_CAPACITY + 1);
+        let (kept, dropped) = std::thread::spawn(move || {
+            let q = EventQueue::new(test_clock());
+            let hot = hot();
+            for i in 0..n {
+                q.push_with_ctx(hot, q.id(), i as u64, 1, 0, EventKind::Begin);
+            }
+            q.record_dropped(COLD.with_borrow_mut(|cold| cold.flush_partial(hot)));
+            let mut out = Vec::new();
+            q.drain_nonblocking(&mut out, usize::MAX);
+            (out.len() as u64, q.dropped())
+        })
+        .join()
+        .unwrap();
+        assert_eq!(kept, (BATCH_N * BATCHES_CAPACITY) as u64);
+        assert_eq!(
+            kept + dropped,
+            n as u64,
+            "the flushed batch vanished without being counted"
+        );
     }
 
     #[test]

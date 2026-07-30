@@ -1,7 +1,7 @@
 use crate::codecache::CodeCache;
 use crate::event::PackedEvent;
 use crate::evqueue::{BATCH_N, EventBatch};
-use rtrb::Producer;
+use rtrb::{Producer, PushError};
 use std::cell::{RefCell, UnsafeCell};
 
 pub const NOT_CACHED: usize = usize::MAX;
@@ -70,15 +70,16 @@ impl Cold {
         hot.end = unsafe { start.add(BATCH_N) };
     }
 
-    pub fn flush_partial(&mut self, hot: &mut Hot) {
+    #[must_use]
+    pub fn flush_partial(&mut self, hot: &mut Hot) -> u64 {
         self.commit(hot);
         let Some(batch) = self.batch.take() else {
-            return;
+            return 0;
         };
         if self.producer.is_none() || batch.events.is_empty() {
             self.batch = Some(batch);
             self.arm(hot);
-            return;
+            return 0;
         }
         self.batch = Some(Box::new(EventBatch::with_capacity(
             BATCH_N,
@@ -87,13 +88,16 @@ impl Cold {
         )));
         self.arm(hot);
         let (_, prod) = self.producer.as_mut().unwrap();
-        let _ = prod.push(batch);
+        match prod.push(batch) {
+            Ok(()) => 0,
+            Err(PushError::Full(lost)) => lost.events.len() as u64,
+        }
     }
 }
 
 impl Drop for Cold {
     fn drop(&mut self) {
-        self.flush_partial(hot());
+        let _no_queue_left_to_charge = self.flush_partial(hot());
     }
 }
 
@@ -173,7 +177,11 @@ mod tests {
             let hot = hot();
             let mut cold = armed(hot);
             walk(hot, 3);
-            cold.flush_partial(hot);
+            assert_eq!(
+                cold.flush_partial(hot),
+                0,
+                "a thread with no producer has nowhere to lose events"
+            );
             assert!(!hot.cursor.is_null());
             assert!(
                 hot.cursor < hot.end,

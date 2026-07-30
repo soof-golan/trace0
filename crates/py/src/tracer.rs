@@ -73,7 +73,7 @@ impl Tracer {
         } = running;
 
         let disabled = monitoring::disable(py, &monitoring);
-        COLD.with_borrow_mut(|cold| cold.flush_partial(hot()));
+        queue.record_dropped(COLD.with_borrow_mut(|cold| cold.flush_partial(hot())));
         queue.close();
         let joined = py.detach(move || exporter.join());
 
