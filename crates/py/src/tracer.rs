@@ -45,13 +45,11 @@ impl Tracer {
         }
 
         let queue = Arc::new(EventQueue::new(Clock::starting_now()));
-        let interner = Arc::new(Interner::new());
-        let threads = Arc::new(ThreadRegistry::new());
         let state = Arc::new(State {
             run: queue.id(),
             queue: queue.clone(),
-            interner: interner.clone(),
-            threads: threads.clone(),
+            interner: Interner::new(),
+            threads: ThreadRegistry::new(),
         });
 
         let exporter = self
@@ -61,8 +59,8 @@ impl Tracer {
 
         let exporter_thread = {
             let queue = queue.clone();
-            let codes: Arc<dyn CodeLookup> = interner.clone();
-            let names: Arc<dyn ThreadNames> = threads.clone();
+            let codes: Arc<dyn CodeLookup> = state.clone();
+            let names: Arc<dyn ThreadNames> = state.clone();
             thread::Builder::new()
                 .name("trace0-exporter".into())
                 .spawn(move || run_pipeline(queue, codes, names, exporter))

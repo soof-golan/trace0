@@ -9,15 +9,31 @@ use trace0_core::clock::read_counter;
 use trace0_core::codecache::CodeCache;
 use trace0_core::event::{EventKind, os_tid};
 use trace0_core::{
-    EventQueue,
+    CodeInfo, CodeLookup, EventQueue, ThreadNames,
     tls::{codes, hot},
 };
 
 pub struct State {
     pub run: u64,
     pub queue: Arc<EventQueue>,
-    pub interner: Arc<Interner>,
-    pub threads: Arc<ThreadRegistry>,
+    pub interner: Interner,
+    pub threads: ThreadRegistry,
+}
+
+impl CodeLookup for State {
+    fn code(&self, id: u32) -> Option<CodeInfo> {
+        self.interner.code(id)
+    }
+}
+
+impl ThreadNames for State {
+    fn name(&self, tid: u32) -> Option<String> {
+        self.threads.name(tid)
+    }
+
+    fn snapshot(&self) -> Vec<(u32, String)> {
+        self.threads.snapshot()
+    }
 }
 
 #[cold]
