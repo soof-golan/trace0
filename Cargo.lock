@@ -868,7 +868,7 @@ dependencies = [
 
 [[package]]
 name = "trace0"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ahash",
  "clap",
@@ -881,7 +881,7 @@ dependencies = [
 
 [[package]]
 name = "trace0-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ahash",
  "libc",
@@ -892,7 +892,7 @@ dependencies = [
 
 [[package]]
 name = "trace0-json"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ahash",
  "serde_json",
@@ -901,7 +901,7 @@ dependencies = [
 
 [[package]]
 name = "trace0-proto"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ahash",
  "prost",
