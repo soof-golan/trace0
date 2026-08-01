@@ -3,7 +3,7 @@ use crate::event::{Event, EventKind, PackedEvent, pack_code_kind};
 use crate::tls::{COLD, Cold, Hot};
 use parking_lot::{Condvar, Mutex};
 use rtrb::{Consumer, RingBuffer};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 pub const BATCH_N: usize = 1024;
@@ -33,6 +33,10 @@ const CACHE_LINE: usize = 64;
 #[repr(align(64))]
 struct Shared {
     consumers: Mutex<Vec<Consumer<Box<EventBatch>>>>,
+    /// Where the next drain starts. A drain stops once it has taken enough
+    /// for one batch, so always starting at the front lets a thread that
+    /// never runs out of events starve every thread behind it.
+    next_consumer: AtomicUsize,
     dropped: AtomicU64,
     closed: AtomicBool,
     wake_lock: Mutex<()>,
@@ -57,6 +61,7 @@ impl EventQueue {
             clock,
             shared: Shared {
                 consumers: Mutex::new(Vec::new()),
+                next_consumer: AtomicUsize::new(0),
                 dropped: AtomicU64::new(0),
                 closed: AtomicBool::new(false),
                 wake_lock: Mutex::new(()),
@@ -173,8 +178,14 @@ impl EventQueue {
 
     pub fn drain_nonblocking(&self, out: &mut Vec<Event>, limit: usize) -> usize {
         let mut consumers = self.shared.consumers.lock();
+        let n = consumers.len();
+        if n == 0 {
+            return 0;
+        }
+        let start = self.shared.next_consumer.fetch_add(1, Ordering::Relaxed) % n;
         let mut got = 0;
-        for c in consumers.iter_mut() {
+        for i in 0..n {
+            let c = &mut consumers[(start + i) % n];
             while let Ok(batch) = c.pop() {
                 got += batch.events.len();
                 self.decode_into(&batch, out);
@@ -195,7 +206,14 @@ impl EventQueue {
             let mut got = 0;
             {
                 let mut consumers = self.shared.consumers.lock();
-                'outer: for c in consumers.iter_mut() {
+                let n = consumers.len();
+                let start = if n == 0 {
+                    0
+                } else {
+                    self.shared.next_consumer.fetch_add(1, Ordering::Relaxed) % n
+                };
+                'outer: for i in 0..n {
+                    let c = &mut consumers[(start + i) % n];
                     while let Ok(batch) = c.pop() {
                         got += batch.events.len();
                         self.decode_into(&batch, out);

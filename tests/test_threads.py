@@ -88,3 +88,42 @@ def test_a_thread_still_parked_at_the_end_keeps_its_last_events(traced):
 
     recorded = slice_names(events)
     assert any("only_the_parked_thread_calls_this" in name for name in recorded)
+
+
+def test_a_busy_thread_does_not_starve_a_quiet_one(traced):
+    """The drain takes only enough for one batch before it stops. Starting
+    that walk at the front every time let a thread that always has events
+    ready hide every thread registered behind it.
+    """
+    import threading
+
+    done = threading.Event()
+
+    def quiet_marker():
+        return 1
+
+    def loud_marker():
+        return 1
+
+    def loud():
+        while not done.is_set():
+            for _ in range(200):
+                loud_marker()
+
+    def quiet():
+        for _ in range(300):
+            quiet_marker()
+
+    def workload():
+        noisy = threading.Thread(target=loud, name="loud")
+        noisy.start()
+        calm = threading.Thread(target=quiet, name="quiet")
+        calm.start()
+        calm.join()
+        done.set()
+        noisy.join()
+
+    recorded = slice_names(traced(workload))
+    assert any("quiet_marker" in name for name in recorded), (
+        "the quiet thread's events never reached the trace"
+    )
