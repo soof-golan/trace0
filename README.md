@@ -23,11 +23,11 @@ the suite CPython itself is judged on, run unmodified on an M4 Mac:
 
 The spread *is* the story: a tracer charges per call, so what a program
 pays depends entirely on how many calls it makes per unit of work, not on
-how long it runs. Reproduce with `scripts/bench_pyperformance.py`.
+how long it runs. Reproduce with `scripts/benchmark.py suite`.
 
 Against the alternatives, on a call-dense workload — transpiling SQL with
 [sqlglot](https://github.com/tobymao/sqlglot), 10.8M events per second of
-work. Reproduce with `scripts/bench_alternatives.py`:
+work. Reproduce with `scripts/benchmark.py alternatives`:
 
 | | wall time | vs vanilla |
 | --- | --- | --- |
@@ -42,7 +42,7 @@ where `cProfile` only keeps per-function aggregates. That protobuf trace was
 197 MB — a full timeline is not free, it is just cheaper in time than in disk.
 The same run as JSON is an order of magnitude larger.
 
-For the callback in isolation, `scripts/bench_producer.py` reports the
+For the callback in isolation, `scripts/benchmark.py overhead` reports the
 difference against the same workload untraced: **~4 ns per event at 8
 threads**, ~13 ns on a single thread. An event is one `PY_START` or
 `PY_RETURN`, so a function call is two.
@@ -122,6 +122,21 @@ mid-run still leaves everything up to its last whole entry.
 
 Early. The tracer works end to end and is covered by tests, but the API is not
 yet stable and wheels are not yet built for every platform.
+
+## Developing
+
+The benchmarks behind every number above live in one script:
+
+```bash
+uv run scripts/benchmark.py --help
+```
+
+`prek` runs the CI checks before a commit lands — formatting and clippy on
+commit, both test suites on push:
+
+```bash
+uv tool install prek && prek install --hook-type pre-commit --hook-type pre-push
+```
 
 ## Layout
 

@@ -28,21 +28,12 @@ const NEEDS_STATE_FIELD: [u8; 2] = [tag::SEQUENCE_FLAGS, SEQ_NEEDS_INCREMENTAL_S
 
 const CATEGORY_IID: u64 = 1;
 
-/// One packet sequence per thread. Perfetto lets a sequence declare a default
-/// track, so events on it need not name their own -- which is what makes a
-/// globally unique track uuid affordable, since the uuid travels once per
-/// thread instead of once per event.
 struct Sequence {
     id: u32,
     header: Vec<u8>,
     name_iids: ahash::AHashMap<u32, u64>,
 }
 
-/// Sequence ids must not collide between processes merged into one trace,
-/// because Perfetto scopes interned names to them and will interleave two
-/// processes that ran at the same time. A slot of 0 belongs to the process
-/// the user launched, whose ids stay one varint byte wide; a child passes its
-/// pid, which is unique among live processes and costs it a wider id.
 const SEQUENCES_PER_SLOT: u32 = 128;
 
 pub struct ProtoExporter<W: Write + Send> {
@@ -58,8 +49,6 @@ pub struct ProtoExporter<W: Write + Send> {
     slot: u32,
 }
 
-/// Track uuids must not collide between processes whose traces are merged
-/// into one file, so each process owns the uuid block named by its pid.
 fn process_uuid_of(pid: i32) -> u64 {
     ((pid as u32 as u64) << 32) | 1
 }
@@ -430,8 +419,6 @@ mod tests {
             .collect()
     }
 
-    /// Interned ids are scoped to their sequence: iid 1 on one thread's
-    /// sequence names a different function than iid 1 on another's.
     fn interned_names(pkts: &[pb::TracePacket]) -> std::collections::HashMap<(u32, u64), String> {
         pkts.iter()
             .flat_map(|p| {
@@ -462,8 +449,6 @@ mod tests {
             .collect()
     }
 
-    /// The track each sequence declared as its default, which is where every
-    /// event on that sequence lands.
     fn sequence_tracks(pkts: &[pb::TracePacket]) -> std::collections::HashMap<u32, u64> {
         pkts.iter()
             .filter_map(|p| {
@@ -489,7 +474,6 @@ mod tests {
             .collect()
     }
 
-    /// Where an event actually lands: its sequence's default track.
     fn track_of(pkts: &[pb::TracePacket], seq: u32) -> u64 {
         sequence_tracks(pkts)[&seq]
     }

@@ -104,13 +104,6 @@ impl Drop for Cold {
     }
 }
 
-/// Where each recording thread keeps its half-filled batch.
-///
-/// A batch is only ever written by its own thread, so ending a run from one
-/// thread used to leave every other thread's newest events sitting in memory:
-/// a thread parked in a pool never reaches `Drop`, and nothing else could see
-/// what it had buffered. Holding the addresses lets the thread that ends the
-/// run collect them.
 struct Recorder {
     cold: *mut Cold,
     hot: *mut Hot,
@@ -133,17 +126,11 @@ fn forget(cold: *mut Cold) {
     RECORDERS.lock().retain(|r| r.cold != cold);
 }
 
-/// A fork clones one thread, so every other entry describes a thread that does
-/// not exist in the child and a batch that belongs to the parent's run.
 pub fn forget_other_threads() {
     let cold = COLD.with(|c| c.as_ptr());
     RECORDERS.lock().retain(|r| r.cold == cold);
 }
 
-/// Collect what every recording thread still holds. Callers disable the
-/// callbacks first, so no thread is adding events; a thread that was inside
-/// one when they stopped has already published its cursor, and the worst this
-/// can miss is an event written in the instant since.
 pub fn flush_every_thread() -> u64 {
     let recorders = RECORDERS.lock();
     let mut lost = 0;

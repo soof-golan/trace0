@@ -13,15 +13,10 @@ use trace0_core::{Clock, CodeLookup, EventQueue, ThreadNames, run_pipeline, tls}
 pub(crate) struct Running {
     queue: Arc<EventQueue>,
     state: Arc<State>,
-    /// Empty only while a fork is in flight, when callbacks must not run.
     monitoring: Option<MonitoringHandle>,
     exporter: thread::JoinHandle<std::io::Result<()>>,
 }
 
-/// The tracer a forking process must hand over to its child. A fork clones one
-/// thread, so the child inherits an exporter thread that does not exist and
-/// locks no one will release; every hook below exists to keep the child from
-/// touching any of it.
 static ACTIVE: Mutex<Option<Py<Tracer>>> = Mutex::new(None);
 static HOOKS_REGISTERED: std::sync::Once = std::sync::Once::new();
 
@@ -37,8 +32,6 @@ impl Tracer {
         self.start(py, 0, false)
     }
 
-    /// A child adds to the file its parent started, under a packet-sequence
-    /// slot of its own so the two streams stay separable once interleaved.
     fn begin_child(&self, py: Python<'_>) -> PyResult<Running> {
         self.start(py, std::process::id(), true)
     }
@@ -110,9 +103,6 @@ impl Tracer {
 const CHILD_OUTPUT: &str = "TRACE0_CHILD_OUTPUT";
 const CHILD_FORMAT: &str = "TRACE0_CHILD_FORMAT";
 
-/// A process started by exec shares no memory with its parent, so the only
-/// thing that reaches it is the environment. The `.pth` shipped with the
-/// package reads these on interpreter startup.
 fn advertise_to_spawned_children(py: Python<'_>, output: &str, format: Format) -> PyResult<()> {
     let environ = py.import("os")?.getattr("environ")?;
     environ.set_item(CHILD_OUTPUT, output)?;
@@ -128,9 +118,6 @@ fn stop_advertising(py: Python<'_>) -> PyResult<()> {
     Ok(())
 }
 
-/// Run `f` against the tracer that is currently tracing, if any. A fork hook
-/// fires for every fork in the process, including forks by programs that never
-/// started a tracer.
 fn with_active<T>(f: impl FnOnce(&Tracer) -> PyResult<T>) -> PyResult<Option<T>> {
     let active = ACTIVE.lock();
     match active.as_ref() {
@@ -139,8 +126,6 @@ fn with_active<T>(f: impl FnOnce(&Tracer) -> PyResult<T>) -> PyResult<Option<T>>
     }
 }
 
-/// Stop delivering callbacks before the address space is cloned, so that no
-/// callback can run in the child against state the child is about to abandon.
 #[pyfunction]
 pub fn _before_fork(py: Python<'_>) -> PyResult<()> {
     with_active(|tracer| {
@@ -167,10 +152,6 @@ pub fn _after_fork_in_parent(py: Python<'_>) -> PyResult<()> {
     Ok(())
 }
 
-/// Start the child's own trace. The inherited run is deliberately leaked: its
-/// exporter thread did not survive the fork, and any lock it held at that
-/// instant is still held by nobody, so reading or dropping that state could
-/// block forever.
 #[pyfunction]
 pub fn _after_fork_in_child(py: Python<'_>) -> PyResult<()> {
     with_active(|tracer| {
@@ -199,8 +180,6 @@ impl Tracer {
     }
 }
 
-/// Registered once per process: `os.register_at_fork` stacks handlers, and a
-/// child inherits the ones its parent registered.
 fn register_fork_hooks(py: Python<'_>) -> PyResult<()> {
     let mut result = Ok(());
     HOOKS_REGISTERED.call_once(|| {
@@ -239,8 +218,6 @@ impl Tracer {
         Self::install(slf, py, me.begin(py)?)
     }
 
-    /// Enter as a process that exec'd out of a traced one: same bookkeeping,
-    /// but writing beside the trace its parent named rather than over it.
     fn _enter_as_child<'py>(slf: &Bound<'py, Self>, py: Python<'py>) -> PyResult<Bound<'py, Self>> {
         let running = slf.get().begin_child(py)?;
         Self::install(slf, py, running)

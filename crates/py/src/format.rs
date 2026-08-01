@@ -25,10 +25,6 @@ impl Format {
         }
     }
 
-    /// Every traced process writes the same file. The one the user launched
-    /// starts it; a child adds to it, and `slot` namespaces that child's packet
-    /// sequences away from everyone else's. The JSON format needs no slot: its
-    /// events carry a pid outright.
     pub fn open(self, path: &str, slot: u32, append: bool) -> io::Result<Box<dyn Exporter>> {
         Ok(match (self, append) {
             (Format::Json, false) => Box::new(JsonExporter::create(path)?),

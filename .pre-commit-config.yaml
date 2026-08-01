@@ -1,10 +1,3 @@
-# Run with prek (https://github.com/j178/prek), which reads this file:
-#
-#     uv tool install prek
-#     prek install --hook-type pre-commit --hook-type pre-push
-#
-# The hooks are the CI jobs, split by how long they take: what gates a commit
-# is what CI fails on first, and the suites wait until you push.
 repos:
   - repo: local
     hooks:
@@ -30,8 +23,6 @@ repos:
         pass_filenames: false
         stages: [pre-push]
 
-      # The one crate that links against CPython has no Rust tests, so the
-      # interpreter-level suite is the only thing that covers it.
       - id: pytest
         name: pytest
         entry: uv run --python 3.13t pytest -q

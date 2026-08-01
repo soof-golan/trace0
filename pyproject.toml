@@ -23,8 +23,6 @@ manifest-path = "crates/py/Cargo.toml"
 module-name = "trace0._core"
 python-source = "python"
 data = "wheel_data"
-# The wheel gets these through `data`; the sdist needs them listed, or a
-# source build produces a wheel with no .pth and traces no spawned children.
 include = [{ path = "wheel_data/**/*", format = "sdist" }]
 
 [tool.uv]

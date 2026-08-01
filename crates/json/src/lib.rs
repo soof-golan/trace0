@@ -2,10 +2,6 @@ use std::io::{self, Write};
 use std::path::Path;
 use trace0_core::{CodeInfo, CodeLookup, Event, Exporter, SharedFile, ThreadNames};
 
-/// Chrome's JSON Array Format: a bare array of entries, each followed by a
-/// comma, with no closing bracket. Every traced process can append to the same
-/// file that way, and a process killed before it finishes still leaves a file
-/// that reads back to the last whole entry.
 pub struct JsonExporter<W: Write + Send> {
     out: W,
     buf: Vec<u8>,
@@ -93,9 +89,6 @@ fn push_string(out: &mut Vec<u8>, s: &str) {
 }
 
 impl JsonExporter<SharedFile> {
-    /// The process the user launched opens the array the others append into.
-    /// The bracket is committed before this returns: a child that forks away
-    /// and commits first would otherwise land ahead of it in the file.
     pub fn create(path: impl AsRef<Path>) -> io::Result<Self> {
         let mut out = SharedFile::create(path)?;
         out.write_all(b"[")?;
@@ -206,8 +199,6 @@ mod tests {
         parse_array(&buf)
     }
 
-    /// The exporter writes a bare comma-separated array so several processes
-    /// can append to one file. Rebuild the document the assertions expect.
     fn parse_array(buf: &[u8]) -> Value {
         let text = std::str::from_utf8(buf).unwrap();
         let body = text.trim_end().trim_end_matches(',');
@@ -221,6 +212,39 @@ mod tests {
             .and_then(|e| e["args"]["count"].as_u64())
             .unwrap_or(0);
         serde_json::json!({ "traceEvents": events, "droppedEvents": dropped })
+    }
+
+    #[test]
+    fn the_stream_never_closes_so_another_process_can_append_to_it() {
+        let batch = |pid: u32, tid: u32| {
+            let mut buf = Vec::new();
+            let mut ex = JsonExporter::new(&mut buf).unwrap().with_pid(pid);
+            ex.write_batch(
+                &[Event::new(0, tid, 0, EventKind::Begin)],
+                &fib_table(),
+                &ThreadTable::new(),
+            )
+            .unwrap();
+            drop(ex);
+            buf
+        };
+
+        let joined = [batch(1, 1), batch(2, 2)].concat();
+        let text = String::from_utf8(joined).unwrap();
+        assert!(text.ends_with(','), "an entry must leave a comma behind it");
+        assert!(
+            !text.contains(']'),
+            "closing the array would lock others out"
+        );
+
+        let events = parse_array(text.as_bytes());
+        let pids: Vec<u64> = events["traceEvents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["pid"].as_u64().unwrap())
+            .collect();
+        assert_eq!(pids, vec![1, 2]);
     }
 
     fn fib_table() -> CodeTable {

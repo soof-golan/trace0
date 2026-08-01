@@ -33,9 +33,6 @@ const CACHE_LINE: usize = 64;
 #[repr(align(64))]
 struct Shared {
     consumers: Mutex<Vec<Consumer<Box<EventBatch>>>>,
-    /// Where the next drain starts. A drain stops once it has taken enough
-    /// for one batch, so always starting at the front lets a thread that
-    /// never runs out of events starve every thread behind it.
     next_consumer: AtomicUsize,
     dropped: AtomicU64,
     closed: AtomicBool,
@@ -280,6 +277,34 @@ mod tests {
         })
         .join()
         .unwrap()
+    }
+
+    #[test]
+    fn a_backlogged_thread_does_not_take_every_drain() {
+        let q = std::sync::Arc::new(EventQueue::new(test_clock()));
+        for (tid, batches) in [(1u32, 4), (2u32, 1)] {
+            let q = q.clone();
+            std::thread::spawn(move || {
+                let hot = hot();
+                for i in 0..batches * BATCH_N {
+                    q.push_with_ctx(hot, q.id(), i as u64, tid, 0, EventKind::Begin);
+                }
+                COLD.with_borrow_mut(|cold| cold.flush_partial(hot));
+            })
+            .join()
+            .unwrap();
+        }
+
+        let mut first = Vec::new();
+        q.drain_nonblocking(&mut first, BATCH_N);
+        let mut second = Vec::new();
+        q.drain_nonblocking(&mut second, BATCH_N);
+
+        assert!(first.iter().all(|e| e.tid == 1), "the backlog drains first");
+        assert!(
+            second.iter().any(|e| e.tid == 2),
+            "the next drain went back to the backlogged thread and starved the other"
+        );
     }
 
     #[test]

@@ -19,8 +19,6 @@ message TracePacket {
   }
 }
 
-// Values every packet on a sequence inherits, so they travel once per
-// sequence instead of once per event.
 message TracePacketDefaults {
   optional TrackEventDefaults track_event_defaults = 11;
 }

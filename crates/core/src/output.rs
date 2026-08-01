@@ -3,31 +3,20 @@ use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::Path;
 
-/// One trace file, written by every process being traced at once.
-///
-/// A commit has to land whole. Two processes appending at the same time would
-/// otherwise splice one's packets into the middle of the other's, and neither
-/// stream would decode. Callers buffer whole packets and commit at packet
-/// boundaries; the lock makes the commit atomic against the other writers.
 pub struct SharedFile {
     file: File,
     buf: Vec<u8>,
 }
 
 impl SharedFile {
-    /// The process the user launched, which starts the file over.
     pub fn create(path: impl AsRef<Path>) -> io::Result<Self> {
         Self::open(path, true)
     }
 
-    /// A child, which adds to whatever its parent has already written.
     pub fn append(path: impl AsRef<Path>) -> io::Result<Self> {
         Self::open(path, false)
     }
 
-    /// Every writer holds the file open in append mode, so that one process
-    /// writing cannot land on top of what another has already committed.
-    /// Starting over is therefore a separate step from opening.
     fn open(path: impl AsRef<Path>, truncate: bool) -> io::Result<Self> {
         if truncate {
             File::create(path.as_ref())?;
