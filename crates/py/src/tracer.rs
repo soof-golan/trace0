@@ -241,10 +241,7 @@ impl Tracer {
 
     /// Enter as a process that exec'd out of a traced one: same bookkeeping,
     /// but writing beside the trace its parent named rather than over it.
-    fn _enter_as_child<'py>(
-        slf: &Bound<'py, Self>,
-        py: Python<'py>,
-    ) -> PyResult<Bound<'py, Self>> {
+    fn _enter_as_child<'py>(slf: &Bound<'py, Self>, py: Python<'py>) -> PyResult<Bound<'py, Self>> {
         let running = slf.get().begin_child(py)?;
         Self::install(slf, py, running)
     }

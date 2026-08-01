@@ -123,7 +123,6 @@ impl<W: Write + Send> JsonExporter<W> {
         self.pid = pid;
         self
     }
-
 }
 
 impl<W: Write + Send> Exporter for JsonExporter<W> {
@@ -212,8 +211,8 @@ mod tests {
     fn parse_array(buf: &[u8]) -> Value {
         let text = std::str::from_utf8(buf).unwrap();
         let body = text.trim_end().trim_end_matches(',');
-        let events: Value = serde_json::from_str(&format!("[{body}]"))
-            .expect("exporter must emit parseable JSON");
+        let events: Value =
+            serde_json::from_str(&format!("[{body}]")).expect("exporter must emit parseable JSON");
         let dropped = events
             .as_array()
             .unwrap()
