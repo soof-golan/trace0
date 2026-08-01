@@ -1,8 +1,7 @@
 use prost::Message;
-use std::fs::File;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, Write};
 use std::path::Path;
-use trace0_core::{CodeLookup, Event, Exporter, ThreadNames};
+use trace0_core::{CodeLookup, Event, Exporter, SharedFile, ThreadNames};
 
 pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/perfetto.protos.rs"));
@@ -65,10 +64,13 @@ fn process_uuid_of(pid: i32) -> u64 {
     ((pid as u32 as u64) << 32) | 1
 }
 
-impl ProtoExporter<BufWriter<File>> {
+impl ProtoExporter<SharedFile> {
     pub fn create(path: impl AsRef<Path>) -> io::Result<Self> {
-        let f = File::create(path)?;
-        Ok(Self::new(BufWriter::with_capacity(1 << 16, f)))
+        Ok(Self::new(SharedFile::create(path)?))
+    }
+
+    pub fn append(path: impl AsRef<Path>) -> io::Result<Self> {
+        Ok(Self::new(SharedFile::append(path)?))
     }
 }
 
@@ -334,7 +336,8 @@ impl<W: Write + Send> Exporter for ProtoExporter<W> {
             let template = self.template(ev.tid, ev.code_id(), ev.kind().opens_slice(), codes)?;
             self.push_event(ev.ts_ns, template);
         }
-        self.out.write_all(&self.buf)
+        self.out.write_all(&self.buf)?;
+        self.out.flush()
     }
 
     fn finish(

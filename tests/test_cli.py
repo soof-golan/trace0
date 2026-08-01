@@ -4,12 +4,12 @@ codebase where a doc comment is load-bearing at runtime, so deleting one
 is a silent regression in the CLI rather than a documentation change.
 """
 
-import json
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+from trace_json import load, slice_names
 
 
 def trace0(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess:
@@ -56,8 +56,7 @@ def test_run_traces_a_script_to_the_requested_path(tmp_path: Path):
     result = trace0("run", "--output", str(out), "--format", "json", str(script))
     assert result.returncode == 0, result.stderr
 
-    trace = json.loads(out.read_text())
-    assert "f" in {e["name"] for e in trace["traceEvents"] if e["ph"] == "B"}
+    assert "f" in slice_names(load(out))
 
 
 def test_the_script_sees_its_own_arguments(tmp_path: Path):
@@ -73,8 +72,7 @@ def test_the_script_sees_its_own_arguments(tmp_path: Path):
 
 
 def names_in(out: Path) -> set[str]:
-    trace = json.loads(out.read_text())
-    return {e["name"] for e in trace["traceEvents"] if e["ph"] == "B"}
+    return slice_names(load(out))
 
 
 def test_a_module_runs_like_python_dash_m(tmp_path: Path):

@@ -7,6 +7,7 @@ smaller and faster to write than the JSON alternative.
 import json
 
 import pytest
+from trace_json import load
 
 from trace0 import Tracer
 
@@ -37,7 +38,7 @@ def test_protobuf_can_be_asked_for_by_name(tmp_path):
 def test_json_is_still_available_by_name(tmp_path):
     out = tmp_path / "out.json"
     trace_to(out, format="json")
-    assert json.loads(out.read_text())["traceEvents"]
+    assert load(out)
 
 
 @pytest.mark.parametrize("alias", ["proto", "pb"])

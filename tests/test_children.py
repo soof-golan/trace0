@@ -1,17 +1,20 @@
-"""A forked child inherits an exporter thread that did not survive the fork.
+"""Every traced process writes into one file, while it runs.
 
-Everything here is about that: the child must not touch the run it inherited,
-must get a trace of its own beside the parent's, and must never block on a lock
-the vanished thread was holding.
+A child reaches tracing one of two ways. `fork` clones the address space, so
+the child inherits an exporter thread that no longer runs and locks nobody will
+release; the fork hooks hand it a run of its own instead. `exec` shares nothing
+but the environment, so the `.pth` picks that child up at interpreter startup.
+Either way the events land in the file the launched process opened, and stay
+separable by pid once they are interleaved there.
 """
 
-import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+from trace_json import dropped_events, load, phase, pids, slice_names
 
 FORK_ONLY = pytest.mark.skipif(
     not hasattr(os, "fork"), reason="fork is not available on this platform"
@@ -25,19 +28,22 @@ def run_script(tmp_path: Path, body: str, out: Path, fmt: str = "json") -> str:
         [sys.executable, "-m", "trace0", "run", "-o", str(out), "-f", fmt, str(script)],
         capture_output=True,
         text=True,
-        timeout=120,
+        timeout=180,
     )
     assert result.returncode == 0, result.stderr
     return result.stdout
 
 
-def names(path: Path) -> set[str]:
-    trace = json.loads(path.read_text())
-    return {e["name"] for e in trace["traceEvents"] if e["ph"] == "B"}
+def sibling_files(out: Path) -> list[Path]:
+    return sorted(p for p in out.parent.glob(f"{out.name}.*"))
 
 
-def child_traces(out: Path) -> list[Path]:
-    return sorted(out.parent.glob(f"{out.name}.*"))
+def names_by_pid(out: Path) -> dict[int, set[str]]:
+    events = load(out)
+    by_pid: dict[int, set[str]] = {}
+    for e in phase(events, "B"):
+        by_pid.setdefault(e["pid"], set()).add(e["name"])
+    return by_pid
 
 
 FORKING_WORKLOAD = """
@@ -59,42 +65,107 @@ only_the_parent_calls_this()
 
 
 @FORK_ONLY
-def test_a_forked_child_writes_its_own_trace(tmp_path: Path):
+def test_a_fork_puts_both_processes_in_one_file(tmp_path: Path):
     out = tmp_path / "t.json"
     run_script(tmp_path, FORKING_WORKLOAD, out)
 
-    children = child_traces(out)
-    assert len(children) == 1, f"expected one child trace, got {children}"
-    assert "only_the_child_calls_this" in names(children[0])
+    assert sibling_files(out) == [], "a child wrote its own file"
+    names = slice_names(load(out))
+    assert "only_the_parent_calls_this" in names
+    assert "only_the_child_calls_this" in names
 
 
 @FORK_ONLY
-def test_the_parent_trace_holds_only_the_parents_work(tmp_path: Path):
+def test_the_two_processes_stay_apart_inside_that_file(tmp_path: Path):
     out = tmp_path / "t.json"
     run_script(tmp_path, FORKING_WORKLOAD, out)
 
-    parent = names(out)
-    assert "only_the_parent_calls_this" in parent
-    assert "only_the_child_calls_this" not in parent
+    by_pid = names_by_pid(out)
+    assert len(by_pid) == 2, f"expected two processes, got {sorted(by_pid)}"
+    parent = next(p for p, n in by_pid.items() if "only_the_parent_calls_this" in n)
+    child = next(p for p, n in by_pid.items() if "only_the_child_calls_this" in n)
+    assert parent != child
+    assert "only_the_child_calls_this" not in by_pid[parent]
+    assert "only_the_parent_calls_this" not in by_pid[child]
+
+
+def test_a_spawned_child_lands_in_the_same_file(tmp_path: Path):
+    out = tmp_path / "t.json"
+    run_script(
+        tmp_path,
+        """
+import subprocess, sys
+subprocess.run(
+    [sys.executable, "-c", "def spawned_work():\\n    return sum(range(300))\\nspawned_work()\\n"],
+    check=True,
+)
+def parent_work():
+    return sum(range(100))
+parent_work()
+""",
+        out,
+    )
+    assert sibling_files(out) == []
+    by_pid = names_by_pid(out)
+    assert len(by_pid) == 2, f"expected two processes, got {sorted(by_pid)}"
+    assert any("spawned_work" in n for n in by_pid.values())
+    assert any("parent_work" in n for n in by_pid.values())
+
+
+def test_multiprocessing_workers_land_in_the_same_file(tmp_path: Path):
+    """`Pool` as a context manager terminates its workers, and a worker killed
+    by a signal never runs the atexit that finishes its trace. Shut the pool
+    down gracefully so the workers get to write theirs.
+    """
+    out = tmp_path / "t.json"
+    run_script(
+        tmp_path,
+        """
+import multiprocessing as mp
+
+def worker_body(n):
+    return sum(i * i for i in range(n))
+
+if __name__ == "__main__":
+    ctx = mp.get_context("spawn")
+    pool = ctx.Pool(2)
+    pool.map(worker_body, [200, 300])
+    pool.close()
+    pool.join()
+""",
+        out,
+    )
+    assert sibling_files(out) == []
+    by_pid = names_by_pid(out)
+    assert any("worker_body" in n for n in by_pid.values())
+    assert len(by_pid) >= 2
 
 
 @FORK_ONLY
-def test_a_child_trace_is_named_for_its_pid(tmp_path: Path):
+def test_a_grandchild_reaches_the_file_too(tmp_path: Path):
     out = tmp_path / "t.json"
-    stdout = run_script(
+    run_script(
         tmp_path,
         """
 import os, sys
+
+def grandchild_work():
+    return sum(range(200))
+
 pid = os.fork()
 if pid == 0:
+    inner = os.fork()
+    if inner == 0:
+        grandchild_work()
+        sys.exit(0)
+    os.waitpid(inner, 0)
     sys.exit(0)
-print(pid)
 os.waitpid(pid, 0)
 """,
         out,
     )
-    child_pid = stdout.strip()
-    assert (tmp_path / f"t.json.{child_pid}").exists()
+    assert "grandchild_work" in slice_names(load(out))
+    assert len(pids(load(out))) >= 3, "a launched process, a child and a grandchild"
 
 
 @FORK_ONLY
@@ -138,56 +209,73 @@ print(hung)
     assert stdout.strip() == "0", f"{stdout.strip()} forked children hung"
 
 
-def test_a_spawned_child_writes_its_own_trace(tmp_path: Path):
-    """A process reached by exec shares no memory with its parent, so it is
-    picked up by the `.pth` at interpreter startup rather than a fork hook."""
-    out = tmp_path / "t.json"
-    run_script(
-        tmp_path,
-        """
-import subprocess, sys
-subprocess.run(
-    [sys.executable, "-c", "def spawned_work():\\n    return sum(range(300))\\nspawned_work()\\n"],
-    check=True,
-)
-def parent_work():
-    return sum(range(100))
-parent_work()
-""",
-        out,
-    )
-    children = child_traces(out)
-    assert len(children) == 1, f"expected one child trace, got {children}"
-    assert "spawned_work" in names(children[0])
-    assert "parent_work" in names(out)
-
-
-def test_multiprocessing_workers_are_traced(tmp_path: Path):
-    """`Pool` as a context manager terminates its workers, and a worker killed
-    by a signal never runs the atexit that finishes its trace. Shut the pool
-    down gracefully so the workers get to write theirs.
-    """
+def test_concurrent_children_never_tear_the_file(tmp_path: Path):
+    """Several processes committing at once must never splice one's entries
+    into the middle of another's, or the file stops parsing."""
     out = tmp_path / "t.json"
     run_script(
         tmp_path,
         """
 import multiprocessing as mp
 
-def worker_body(n):
-    return sum(i * i for i in range(n))
+def busy(n):
+    total = 0
+    for i in range(n):
+        total += sum(range(50))
+    return total
 
 if __name__ == "__main__":
     ctx = mp.get_context("spawn")
-    pool = ctx.Pool(2)
-    pool.map(worker_body, [200, 300])
+    pool = ctx.Pool(4)
+    pool.map(busy, [200] * 8)
     pool.close()
     pool.join()
 """,
         out,
     )
-    children = child_traces(out)
-    assert children, "no worker was traced"
-    assert any("worker_body" in names(t) for t in children)
+    events = load(out)
+    assert len(events) > 1000
+    assert len(pids(events)) >= 4
+
+
+def test_a_pool_loses_no_calls_at_all(tmp_path: Path):
+    """The count is exact on purpose. Every worker runs its calls on a second
+    thread that is still alive when the worker's run ends, which is where
+    events used to go missing without even being counted as dropped.
+    """
+    out = tmp_path / "t.json"
+    run_script(
+        tmp_path,
+        """
+import multiprocessing as mp, threading
+
+CALLS = 500
+
+def marker_fn():
+    return 1
+
+def on_a_thread():
+    for _ in range(CALLS):
+        marker_fn()
+
+def worker(_):
+    t = threading.Thread(target=on_a_thread, name="worker-side")
+    t.start()
+    t.join()
+
+if __name__ == "__main__":
+    ctx = mp.get_context("spawn")
+    pool = ctx.Pool(4)
+    pool.map(worker, range(8))
+    pool.close()
+    pool.join()
+""",
+        out,
+    )
+    events = load(out)
+    recorded = sum(1 for e in phase(events, "B") if e["name"] == "marker_fn")
+    assert dropped_events(events) == 0
+    assert recorded == 8 * 500, f"expected 4000 calls, recorded {recorded}"
 
 
 def test_nothing_is_traced_once_the_run_is_over(tmp_path: Path):
@@ -202,32 +290,3 @@ def test_nothing_is_traced_once_the_run_is_over(tmp_path: Path):
         text=True,
     )
     assert leaked.stdout.strip() == "None"
-    assert not child_traces(out)
-
-
-@FORK_ONLY
-def test_a_child_that_forks_again_still_traces(tmp_path: Path):
-    out = tmp_path / "t.json"
-    run_script(
-        tmp_path,
-        """
-import os, sys
-
-def grandchild_work():
-    return sum(range(200))
-
-pid = os.fork()
-if pid == 0:
-    inner = os.fork()
-    if inner == 0:
-        grandchild_work()
-        sys.exit(0)
-    os.waitpid(inner, 0)
-    sys.exit(0)
-os.waitpid(pid, 0)
-""",
-        out,
-    )
-    traces = child_traces(out)
-    assert len(traces) == 2, f"a child and a grandchild, got {traces}"
-    assert any("grandchild_work" in names(t) for t in traces)

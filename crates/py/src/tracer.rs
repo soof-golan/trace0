@@ -8,10 +8,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyType;
 use std::sync::Arc;
 use std::thread;
-use trace0_core::{
-    Clock, CodeLookup, EventQueue, ThreadNames, run_pipeline,
-    tls::{COLD, hot},
-};
+use trace0_core::{Clock, CodeLookup, EventQueue, ThreadNames, run_pipeline, tls};
 
 pub(crate) struct Running {
     queue: Arc<EventQueue>,
@@ -37,17 +34,16 @@ pub struct Tracer {
 
 impl Tracer {
     pub(crate) fn begin(&self, py: Python<'_>) -> PyResult<Running> {
-        self.start(py, self.output.clone(), 0)
+        self.start(py, 0, false)
     }
 
-    /// A child writes beside its parent rather than over it, and namespaces its
-    /// packet sequences by pid so the two traces can be concatenated.
+    /// A child adds to the file its parent started, under a packet-sequence
+    /// slot of its own so the two streams stay separable once interleaved.
     fn begin_child(&self, py: Python<'_>) -> PyResult<Running> {
-        let pid = std::process::id();
-        self.start(py, format!("{}.{pid}", self.output), pid)
+        self.start(py, std::process::id(), true)
     }
 
-    fn start(&self, py: Python<'_>, output: String, slot: u32) -> PyResult<Running> {
+    fn start(&self, py: Python<'_>, slot: u32, append: bool) -> PyResult<Running> {
         let queue = Arc::new(EventQueue::new(Clock::starting_now()));
         let state = Arc::new(State {
             run: queue.id(),
@@ -58,7 +54,7 @@ impl Tracer {
 
         let sink = self
             .format
-            .open(&output, slot)
+            .open(&self.output, slot, append)
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
         let exporter = {
@@ -98,7 +94,7 @@ impl Tracer {
             Some(h) => monitoring::disable(py, h),
             None => Ok(()),
         };
-        queue.record_dropped(COLD.with_borrow_mut(|cold| cold.flush_partial(hot())));
+        queue.record_dropped(tls::flush_every_thread());
         queue.close();
         let joined = py.detach(move || exporter.join());
 
@@ -180,6 +176,7 @@ pub fn _after_fork_in_child(py: Python<'_>) -> PyResult<()> {
     with_active(|tracer| {
         let mut slot = tracer.running.lock();
         std::mem::forget(slot.take());
+        tls::forget_other_threads();
         *slot = Some(tracer.begin_child(py)?);
         Ok(())
     })?;

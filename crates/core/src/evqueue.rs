@@ -106,6 +106,7 @@ impl EventQueue {
         self.shared.consumers.lock().push(cons);
         cold.producer = Some((self.id, prod));
         cold.batch = Some(Box::new(EventBatch::with_capacity(BATCH_N, ticks, tid)));
+        crate::tls::register_current();
         hot.queue_id = self.id;
         hot.clock_direct = self.clock.is_direct();
         cold.arm(hot);

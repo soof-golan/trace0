@@ -17,7 +17,7 @@ import threading
 import pytest
 
 from trace0 import Tracer
-from trace_json import phase, threads_with_slices
+from trace_json import dropped_events, load, phase, threads_with_slices
 
 WORKERS = 3
 
@@ -56,7 +56,7 @@ def test_one_tracer_traces_as_many_times_as_asked(tmp_path):
     for _ in range(3):
         with tracer:
             work()
-    assert phase(json.loads((tmp_path / "reused.json").read_text()), "B")
+    assert phase(load(tmp_path / "reused.json"), "B")
 
 
 def test_repeated_cycles_stay_sound(tmp_path):
@@ -67,7 +67,7 @@ def test_repeated_cycles_stay_sound(tmp_path):
         path = tmp_path / f"cycle{i}.json"
         with Tracer(str(path), format="json"):
             work()
-        assert json.loads(path.read_text())["droppedEvents"] == 0
+        assert dropped_events(load(path)) == 0
 
 
 def test_no_event_precedes_the_clock_anchor(traced):
@@ -94,7 +94,7 @@ def test_a_second_tracer_cannot_run_inside_the_first(tmp_path):
             with Tracer(str(tmp_path / "inner.json"), format="json"):
                 pass
         work()
-    assert phase(json.loads(outer.read_text()), "B")
+    assert phase(load(outer), "B")
 
 
 def test_a_workload_that_raises_still_leaves_a_trace(tmp_path):
@@ -103,4 +103,4 @@ def test_a_workload_that_raises_still_leaves_a_trace(tmp_path):
         with Tracer(str(path), format="json"):
             work()
             1 / 0
-    assert phase(json.loads(path.read_text()), "B")
+    assert phase(load(path), "B")

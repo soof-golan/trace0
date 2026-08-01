@@ -1,10 +1,10 @@
 import itertools
-import json
 from pathlib import Path
 
 import pytest
 
 from trace0 import Tracer
+from trace_json import load
 
 
 @pytest.fixture
@@ -16,10 +16,10 @@ def traced(tmp_path: Path):
     """
     counter = itertools.count()
 
-    def run(workload) -> dict:
+    def run(workload) -> list[dict]:
         path = tmp_path / f"trace{next(counter)}.json"
         with Tracer(str(path), format="json"):
             workload()
-        return json.loads(path.read_text())
+        return load(path)
 
     return run

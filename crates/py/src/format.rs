@@ -25,13 +25,16 @@ impl Format {
         }
     }
 
-    /// `slot` namespaces a child's packet sequences away from every other
-    /// process merged into the same trace. The JSON format needs no such thing:
-    /// its events carry a pid outright.
-    pub fn open(self, path: &str, slot: u32) -> io::Result<Box<dyn Exporter>> {
-        Ok(match self {
-            Format::Json => Box::new(JsonExporter::create(path)?),
-            Format::Protobuf => Box::new(ProtoExporter::create(path)?.with_slot(slot)),
+    /// Every traced process writes the same file. The one the user launched
+    /// starts it; a child adds to it, and `slot` namespaces that child's packet
+    /// sequences away from everyone else's. The JSON format needs no slot: its
+    /// events carry a pid outright.
+    pub fn open(self, path: &str, slot: u32, append: bool) -> io::Result<Box<dyn Exporter>> {
+        Ok(match (self, append) {
+            (Format::Json, false) => Box::new(JsonExporter::create(path)?),
+            (Format::Json, true) => Box::new(JsonExporter::append(path)?),
+            (Format::Protobuf, false) => Box::new(ProtoExporter::create(path)?.with_slot(slot)),
+            (Format::Protobuf, true) => Box::new(ProtoExporter::append(path)?.with_slot(slot)),
         })
     }
 }

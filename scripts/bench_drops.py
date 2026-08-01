@@ -13,6 +13,20 @@ from pathlib import Path
 
 from trace0 import Tracer
 
+
+def load(path: Path) -> list[dict]:
+    """The tracer writes the JSON Array Format: entries each followed by a
+    comma and no closing bracket, so every process can append to one file."""
+    text = path.read_text().rstrip()
+    return json.loads(text.rstrip(",") + "]")
+
+
+def dropped_events(events: list[dict]) -> int:
+    return sum(
+        e["args"]["count"] for e in events if e.get("name") == "trace0_dropped_events"
+    )
+
+
 DEPTH = 24
 
 
@@ -35,10 +49,10 @@ def run(n_threads: int) -> dict:
             for t in threads:
                 t.join()
         elapsed = time.perf_counter() - start
-        trace = json.loads(out.read_text())
+        events = load(out)
 
-    kept = sum(1 for e in trace["traceEvents"] if e["ph"] in ("B", "E"))
-    dropped = trace["droppedEvents"]
+    kept = sum(1 for e in events if e["ph"] in ("B", "E"))
+    dropped = dropped_events(events)
     total = kept + dropped
     return {
         "threads": n_threads,

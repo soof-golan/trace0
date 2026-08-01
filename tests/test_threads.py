@@ -10,7 +10,7 @@ the answer would leave every worker thread unnamed.
 import _thread
 import threading
 
-from trace_json import thread_names, threads_with_slices
+from trace_json import slice_names, thread_names, threads_with_slices
 
 WORKERS = 4
 
@@ -57,3 +57,34 @@ def test_a_raw_thread_never_registered_with_threading_is_survivable(traced):
         assert done.wait(5), "raw thread never ran"
 
     assert thread_names(traced(workload)) is not None
+
+
+def test_a_thread_still_parked_at_the_end_keeps_its_last_events(traced):
+    """A pool thread does not exit when the run ends, so nothing used to
+    collect the batch it was still filling. Its newest events were dropped
+    silently -- not even counted, because they never reached the queue.
+    """
+    import threading
+
+    release = threading.Event()
+    parked = threading.Event()
+
+    def only_the_parked_thread_calls_this():
+        return sum(range(20))
+
+    def park():
+        for _ in range(30):
+            only_the_parked_thread_calls_this()
+        parked.set()
+        release.wait(10)
+
+    def workload():
+        worker = threading.Thread(target=park, name="parked")
+        worker.start()
+        parked.wait(10)
+
+    events = traced(workload)
+    release.set()
+
+    recorded = slice_names(events)
+    assert any("only_the_parked_thread_calls_this" in name for name in recorded)

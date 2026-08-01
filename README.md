@@ -101,24 +101,22 @@ slower to write, but human-readable and diffable.
 ## Child processes
 
 Children are traced too, whether they arrive by `fork` or by `exec`, so
-`multiprocessing`, `subprocess` and worker-based servers all show up. Each
-process writes beside the one that launched it:
-
-```
-trace.pb        the process you ran
-trace.pb.5421   a child
-trace.pb.5422   another
-```
-
-Concatenating them gives Perfetto one trace with a track per process:
+`multiprocessing`, `subprocess` and worker-based servers all show up. They
+write into the same file as they run, so there is nothing to merge afterwards:
 
 ```bash
-cat trace.pb trace.pb.* > merged.pb
+trace0 run --output trace.pb -m uvicorn app:app --workers 4
 ```
 
-A child killed by a signal never finishes its file. `Pool` used as a context
-manager terminates its workers, so close and join it instead when you want
-their traces.
+leaves one `trace.pb` holding every worker, on a track of its own. Each process
+buffers whole packets and commits them under a lock, so two processes writing
+at once never splice into each other, and each namespaces its packet sequences
+by pid so Perfetto keeps them apart.
+
+JSON traces use the Chrome JSON Array Format for the same reason — entries
+follow one another with a trailing comma and no closing bracket. That is what
+lets several processes append to one array, and it means a process killed
+mid-run still leaves everything up to its last whole entry.
 
 ## Status
 

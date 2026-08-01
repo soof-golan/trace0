@@ -1,12 +1,14 @@
-use std::fs::File;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, Write};
 use std::path::Path;
-use trace0_core::{CodeInfo, CodeLookup, Event, Exporter, ThreadNames};
+use trace0_core::{CodeInfo, CodeLookup, Event, Exporter, SharedFile, ThreadNames};
 
+/// Chrome's JSON Array Format: a bare array of entries, each followed by a
+/// comma, with no closing bracket. Every traced process can append to the same
+/// file that way, and a process killed before it finishes still leaves a file
+/// that reads back to the last whole entry.
 pub struct JsonExporter<W: Write + Send> {
     out: W,
     buf: Vec<u8>,
-    first: bool,
     pid: u32,
     templates: ahash::AHashMap<u32, Template>,
 }
@@ -90,20 +92,28 @@ fn push_string(out: &mut Vec<u8>, s: &str) {
     out.push(b'"');
 }
 
-impl JsonExporter<BufWriter<File>> {
+impl JsonExporter<SharedFile> {
+    /// The process the user launched opens the array the others append into.
+    /// The bracket is committed before this returns: a child that forks away
+    /// and commits first would otherwise land ahead of it in the file.
     pub fn create(path: impl AsRef<Path>) -> io::Result<Self> {
-        let f = File::create(path)?;
-        Self::new(BufWriter::with_capacity(1 << 16, f))
+        let mut out = SharedFile::create(path)?;
+        out.write_all(b"[")?;
+        out.flush()?;
+        Self::new(out)
+    }
+
+    pub fn append(path: impl AsRef<Path>) -> io::Result<Self> {
+        Self::new(SharedFile::append(path)?)
     }
 }
 
 impl<W: Write + Send> JsonExporter<W> {
     pub fn new(mut out: W) -> io::Result<Self> {
-        out.write_all(b"{\"traceEvents\":[")?;
+        let _ = &mut out;
         Ok(Self {
             out,
             buf: Vec::with_capacity(1 << 18),
-            first: true,
             pid: std::process::id(),
             templates: ahash::AHashMap::new(),
         })
@@ -114,13 +124,6 @@ impl<W: Write + Send> JsonExporter<W> {
         self
     }
 
-    fn separator(&mut self) -> io::Result<()> {
-        if !self.first {
-            self.out.write_all(b",")?;
-        }
-        self.first = false;
-        Ok(())
-    }
 }
 
 impl<W: Write + Send> Exporter for JsonExporter<W> {
@@ -139,11 +142,6 @@ impl<W: Write + Send> Exporter for JsonExporter<W> {
                 .or_insert_with(|| Template::of(&codes.code(id).unwrap_or_default()));
             let kind = ev.kind();
 
-            if !self.first {
-                self.buf.push(b',');
-            }
-            self.first = false;
-
             self.buf.extend_from_slice(&template.head);
             self.buf.push(if kind.opens_slice() { b'B' } else { b'E' });
             self.buf.extend_from_slice(b"\",\"ts\":");
@@ -154,9 +152,10 @@ impl<W: Write + Send> Exporter for JsonExporter<W> {
             push_u64(&mut self.buf, ev.tid as u64);
             self.buf.extend_from_slice(&template.tail);
             self.buf.extend_from_slice(kind.as_str().as_bytes());
-            self.buf.extend_from_slice(b"\"}}");
+            self.buf.extend_from_slice(b"\"}},");
         }
-        self.out.write_all(&self.buf)
+        self.out.write_all(&self.buf)?;
+        self.out.flush()
     }
 
     fn finish(
@@ -167,7 +166,6 @@ impl<W: Write + Send> Exporter for JsonExporter<W> {
     ) -> io::Result<()> {
         let pid = self.pid;
         for (tid, name) in threads.snapshot() {
-            self.separator()?;
             let entry = serde_json::json!({
                 "name": "thread_name",
                 "ph": "M",
@@ -176,8 +174,19 @@ impl<W: Write + Send> Exporter for JsonExporter<W> {
                 "args": { "name": name },
             });
             serde_json::to_writer(&mut self.out, &entry)?;
+            self.out.write_all(b",")?;
         }
-        write!(self.out, "],\"droppedEvents\":{dropped}}}")?;
+        if dropped > 0 {
+            let entry = serde_json::json!({
+                "name": "trace0_dropped_events",
+                "ph": "M",
+                "pid": pid,
+                "tid": 0,
+                "args": { "count": dropped },
+            });
+            serde_json::to_writer(&mut self.out, &entry)?;
+            self.out.write_all(b",")?;
+        }
         self.out.flush()
     }
 }
@@ -195,7 +204,24 @@ mod tests {
             ex.write_batch(events, codes, threads).unwrap();
             ex.finish(codes, threads, dropped).unwrap();
         }
-        serde_json::from_slice(&buf).expect("exporter must emit parseable JSON")
+        parse_array(&buf)
+    }
+
+    /// The exporter writes a bare comma-separated array so several processes
+    /// can append to one file. Rebuild the document the assertions expect.
+    fn parse_array(buf: &[u8]) -> Value {
+        let text = std::str::from_utf8(buf).unwrap();
+        let body = text.trim_end().trim_end_matches(',');
+        let events: Value = serde_json::from_str(&format!("[{body}]"))
+            .expect("exporter must emit parseable JSON");
+        let dropped = events
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == "trace0_dropped_events")
+            .and_then(|e| e["args"]["count"].as_u64())
+            .unwrap_or(0);
+        serde_json::json!({ "traceEvents": events, "droppedEvents": dropped })
     }
 
     fn fib_table() -> CodeTable {

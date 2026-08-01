@@ -13,6 +13,20 @@ from pathlib import Path
 
 from trace0 import Tracer
 
+
+def load(path: Path) -> list[dict]:
+    """The tracer writes the JSON Array Format: entries each followed by a
+    comma and no closing bracket, so every process can append to one file."""
+    text = path.read_text().rstrip()
+    return json.loads(text.rstrip(",") + "]")
+
+
+def dropped_events(events: list[dict]) -> int:
+    return sum(
+        e["args"]["count"] for e in events if e.get("name") == "trace0_dropped_events"
+    )
+
+
 SLEEP = 0.05
 
 
@@ -37,7 +51,7 @@ def trace_to(path: Path) -> tuple[dict, float]:
         for t in workers:
             t.join()
         wall = time.perf_counter() - started
-    return json.loads(path.read_text()), wall
+    return load(path), wall
 
 
 def check_slices_are_balanced(events: list[dict]) -> None:
@@ -89,12 +103,10 @@ def threads_with_slices(events: list[dict]) -> set[str]:
     return {named.get(tid, str(tid)) for tid in sliced}
 
 
-def check(trace: dict, wall: float, run: int) -> int:
-    events = trace["traceEvents"]
+def check(events: list[dict], wall: float, run: int) -> int:
     assert events, f"run {run}: traced a real workload but got no events"
-    assert trace["droppedEvents"] == 0, (
-        f"run {run}: dropped {trace['droppedEvents']} events"
-    )
+    dropped = dropped_events(events)
+    assert dropped == 0, f"run {run}: dropped {dropped} events"
 
     check_slices_are_balanced(events)
     check_durations_are_wall_clock(events, wall)
@@ -114,9 +126,9 @@ def main() -> None:
     counts, threads = [], []
     with tempfile.TemporaryDirectory() as d:
         for run in (1, 2):
-            trace, wall = trace_to(Path(d) / f"smoke{run}.json")
-            counts.append(check(trace, wall, run))
-            threads.append(threads_with_slices(trace["traceEvents"]))
+            events, wall = trace_to(Path(d) / f"smoke{run}.json")
+            counts.append(check(events, wall, run))
+            threads.append(threads_with_slices(events))
 
     assert threads[0] == threads[1], (
         f"threads recorded in run 1 but not run 2: {threads[0] - threads[1]}"
