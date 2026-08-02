@@ -50,6 +50,23 @@ jobs:
       - name: Invariants that need a live interpreter
         run: uv run --python ${{ matrix.python }} pytest
 
+  servers:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v7
+      - name: Trace every worker of a real server
+        run: uv run --python 3.13 --group e2e pytest -m e2e -q
+
   perfetto:
     runs-on: ${{ matrix.runner }}
     strategy:

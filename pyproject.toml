@@ -43,6 +43,18 @@ build-backend = "maturin"
 dev = [
     "pytest>=9.1.1",
 ]
+e2e = [
+    "django>=6.0.7",
+    "fastapi>=0.141.1",
+    "gunicorn>=26.0.0",
+    "hypercorn>=0.18.0",
+    "uvicorn>=0.52.1",
+    "uvloop>=0.22.1",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-m 'not e2e'"
+markers = [
+    "e2e: launches a real server; needs the e2e dependency group and runs for minutes",
+]

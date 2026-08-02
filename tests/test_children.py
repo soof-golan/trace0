@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from trace_json import dropped_events, load, phase, pids, slice_names
+from trace_json import dropped_events, load, named_meta, phase, pids, slice_names
 
 FORK_ONLY = pytest.mark.skipif(
     not hasattr(os, "fork"), reason="fork is not available on this platform"
@@ -207,6 +207,49 @@ print(hung)
         out,
     )
     assert stdout.strip() == "0", f"{stdout.strip()} forked children hung"
+
+
+@FORK_ONLY
+def test_a_forked_child_keeps_the_events_it_records_just_before_exiting(
+    tmp_path: Path,
+):
+    """A forked child ends its run before it exits, and writes what it held.
+
+    `sys.exit` unwinds out of the script and back into the CLI, which stops
+    the tracer it started -- and in the child that is the run the fork hooks
+    installed. Everything the child recorded since the exporter last drained
+    reaches the file there, so the count is exact and its threads are named.
+    """
+    out = tmp_path / "t.json"
+    run_script(
+        tmp_path,
+        """
+import os, sys
+
+CHILDREN = 8
+CALLS = 300
+
+def child_tail_marker():
+    return 1
+
+for _ in range(CHILDREN):
+    pid = os.fork()
+    if pid == 0:
+        for _ in range(CALLS):
+            child_tail_marker()
+        sys.exit(0)
+    os.waitpid(pid, 0)
+""",
+        out,
+    )
+    events = load(out)
+    finished = {e["pid"] for e in named_meta(events)}
+    assert pids(events) == finished, (
+        f"processes that never ended their run: {sorted(pids(events) - finished)}"
+    )
+    recorded = sum(1 for e in phase(events, "B") if e["name"] == "child_tail_marker")
+    assert dropped_events(events) == 0
+    assert recorded == 8 * 300, f"expected 2400 calls, recorded {recorded}"
 
 
 def test_concurrent_children_never_tear_the_file(tmp_path: Path):
