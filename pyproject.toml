@@ -1,6 +1,6 @@
 [project]
 name = "trace0"
-version = "0.1.10"
+version = "0.1.11"
 description = "A low-overhead tracing profiler for Python, built on sys.monitoring, emitting Perfetto traces."
 readme = "README.md"
 license = "MIT"
