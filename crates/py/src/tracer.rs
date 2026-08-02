@@ -19,11 +19,15 @@ pub(crate) struct Running {
 
 static ACTIVE: Mutex<Option<Py<Tracer>>> = Mutex::new(None);
 static HOOKS_REGISTERED: std::sync::Once = std::sync::Once::new();
+static REPLACED_HANDLERS: Mutex<Vec<(i32, Py<PyAny>)>> = Mutex::new(Vec::new());
+
+const DEADLY_SIGNALS: [&str; 3] = ["SIGTERM", "SIGHUP", "SIGQUIT"];
 
 #[pyclass(module = "trace0._core", frozen)]
 pub struct Tracer {
     output: String,
     format: Format,
+    trace_subprocesses: bool,
     running: Mutex<Option<Running>>,
 }
 
@@ -118,6 +122,88 @@ fn stop_advertising(py: Python<'_>) -> PyResult<()> {
     Ok(())
 }
 
+fn our_handler(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+    py.import("trace0._core")?.getattr("_handle_deadly_signal")
+}
+
+fn take_over_deadly_signals(py: Python<'_>) -> PyResult<()> {
+    let signal = py.import("signal")?;
+    let ours = our_handler(py)?;
+    let mut replaced = REPLACED_HANDLERS.lock();
+    for name in DEADLY_SIGNALS {
+        let Ok(sig) = signal.getattr(name) else {
+            continue;
+        };
+        let Ok(previous) = signal.call_method1("getsignal", (&sig,)) else {
+            continue;
+        };
+        if previous.is(&ours) {
+            continue;
+        }
+        if signal.call_method1("signal", (&sig, &ours)).is_err() {
+            continue;
+        }
+        let number: i32 = sig.extract()?;
+        replaced.retain(|(n, _)| *n != number);
+        replaced.push((number, previous.unbind()));
+    }
+    Ok(())
+}
+
+fn hand_back_deadly_signals(py: Python<'_>) -> PyResult<()> {
+    let signal = py.import("signal")?;
+    let ours = our_handler(py)?;
+    for (number, previous) in REPLACED_HANDLERS.lock().drain(..) {
+        let Ok(current) = signal.call_method1("getsignal", (number,)) else {
+            continue;
+        };
+        if current.is(&ours) {
+            signal.call_method1("signal", (number, previous)).ok();
+        }
+    }
+    Ok(())
+}
+
+fn end_active_run(py: Python<'_>) -> PyResult<()> {
+    let Some(active) = ACTIVE.try_lock() else {
+        return Ok(());
+    };
+    let Some(tracer) = active.as_ref() else {
+        return Ok(());
+    };
+    let Some(mut slot) = tracer.get().running.try_lock() else {
+        return Ok(());
+    };
+    match slot.take() {
+        Some(running) => Tracer::end(py, running),
+        None => Ok(()),
+    }
+}
+
+#[pyfunction]
+pub fn _handle_deadly_signal(py: Python<'_>, signum: i32, frame: Py<PyAny>) -> PyResult<()> {
+    let signal = py.import("signal")?;
+    let previous = REPLACED_HANDLERS
+        .lock()
+        .iter()
+        .find(|(number, _)| *number == signum)
+        .map(|(_, handler)| handler.clone_ref(py));
+    let Some(previous) = previous else {
+        return Ok(());
+    };
+
+    if previous.bind(py).is_callable() {
+        previous.call1(py, (signum, frame))?;
+        return Ok(());
+    }
+    if previous.is(&signal.getattr("SIG_DFL")?) {
+        end_active_run(py)?;
+    }
+    signal.call_method1("signal", (signum, previous))?;
+    signal.call_method1("raise_signal", (signum,))?;
+    Ok(())
+}
+
 fn with_active<T>(f: impl FnOnce(&Tracer) -> PyResult<T>) -> PyResult<Option<T>> {
     let active = ACTIVE.lock();
     match active.as_ref() {
@@ -158,7 +244,9 @@ pub fn _after_fork_in_child(py: Python<'_>) -> PyResult<()> {
         let mut slot = tracer.running.lock();
         std::mem::forget(slot.take());
         tls::forget_other_threads();
-        *slot = Some(tracer.begin_child(py)?);
+        if tracer.trace_subprocesses {
+            *slot = Some(tracer.begin_child(py)?);
+        }
         Ok(())
     })?;
     Ok(())
@@ -171,6 +259,7 @@ impl Tracer {
         running: Running,
     ) -> PyResult<Bound<'py, Self>> {
         register_fork_hooks(py)?;
+        take_over_deadly_signals(py)?;
         let mut slot = slf.get().running.lock();
         debug_assert!(slot.is_none(), "entered a run that was still going");
         *slot = Some(running);
@@ -200,11 +289,12 @@ fn register_fork_hooks(py: Python<'_>) -> PyResult<()> {
 #[pymethods]
 impl Tracer {
     #[new]
-    #[pyo3(signature = (output, format = "protobuf".to_string()))]
-    pub(crate) fn new(output: String, format: String) -> PyResult<Self> {
+    #[pyo3(signature = (output, format = "protobuf".to_string(), trace_subprocesses = true))]
+    pub(crate) fn new(output: String, format: String, trace_subprocesses: bool) -> PyResult<Self> {
         Ok(Self {
             output,
             format: Format::parse(&format).map_err(PyValueError::new_err)?,
+            trace_subprocesses,
             running: Mutex::new(None),
         })
     }
@@ -214,7 +304,10 @@ impl Tracer {
         py: Python<'py>,
     ) -> PyResult<Bound<'py, Self>> {
         let me = slf.get();
-        advertise_to_spawned_children(py, &me.output, me.format)?;
+        match me.trace_subprocesses {
+            true => advertise_to_spawned_children(py, &me.output, me.format)?,
+            false => stop_advertising(py)?,
+        }
         Self::install(slf, py, me.begin(py)?)
     }
 
@@ -231,10 +324,10 @@ impl Tracer {
         _exc_tb: Option<Bound<'_, pyo3::types::PyAny>>,
     ) -> PyResult<bool> {
         *ACTIVE.lock() = None;
+        hand_back_deadly_signals(py)?;
         stop_advertising(py)?;
-        match self.running.lock().take() {
-            Some(running) => Tracer::end(py, running)?,
-            None => return Err(PyRuntimeError::new_err("tracer is not tracing")),
+        if let Some(running) = self.running.lock().take() {
+            Tracer::end(py, running)?;
         }
         Ok(false)
     }

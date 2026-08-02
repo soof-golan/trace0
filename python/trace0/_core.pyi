@@ -9,6 +9,7 @@ class Tracer:
         self,
         output: str,
         format: TraceFormat = "protobuf",
+        trace_subprocesses: bool = True,
     ) -> None: ...
 
     def __enter__(self) -> "Tracer": ...

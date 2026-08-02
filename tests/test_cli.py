@@ -30,6 +30,7 @@ def trace0(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess:
         "Arguments forwarded",
         "library module",
         "[default: protobuf]",
+        "Trace only this process",
     ],
 )
 def test_run_help_documents_every_argument(text: str):

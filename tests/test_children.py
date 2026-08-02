@@ -16,16 +16,29 @@ from pathlib import Path
 import pytest
 from trace_json import dropped_events, load, named_meta, phase, pids, slice_names
 
+from trace0 import Tracer
+
 FORK_ONLY = pytest.mark.skipif(
     not hasattr(os, "fork"), reason="fork is not available on this platform"
 )
 
 
-def run_script(tmp_path: Path, body: str, out: Path, fmt: str = "json") -> str:
+def run_script(
+    tmp_path: Path,
+    body: str,
+    out: Path,
+    fmt: str = "json",
+    flags: tuple[str, ...] = (),
+) -> str:
     script = tmp_path / "workload.py"
     script.write_text(body)
     result = subprocess.run(
-        [sys.executable, "-m", "trace0", "run", "-o", str(out), "-f", fmt, str(script)],
+        [
+            *(sys.executable, "-m", "trace0", "run"),
+            *("-o", str(out), "-f", fmt),
+            *flags,
+            str(script),
+        ],
         capture_output=True,
         text=True,
         timeout=180,
@@ -89,11 +102,7 @@ def test_the_two_processes_stay_apart_inside_that_file(tmp_path: Path):
     assert "only_the_parent_calls_this" not in by_pid[child]
 
 
-def test_a_spawned_child_lands_in_the_same_file(tmp_path: Path):
-    out = tmp_path / "t.json"
-    run_script(
-        tmp_path,
-        """
+SPAWNING_WORKLOAD = """
 import subprocess, sys
 subprocess.run(
     [sys.executable, "-c", "def spawned_work():\\n    return sum(range(300))\\nspawned_work()\\n"],
@@ -102,9 +111,12 @@ subprocess.run(
 def parent_work():
     return sum(range(100))
 parent_work()
-""",
-        out,
-    )
+"""
+
+
+def test_a_spawned_child_lands_in_the_same_file(tmp_path: Path):
+    out = tmp_path / "t.json"
+    run_script(tmp_path, SPAWNING_WORKLOAD, out)
     assert sibling_files(out) == []
     by_pid = names_by_pid(out)
     assert len(by_pid) == 2, f"expected two processes, got {sorted(by_pid)}"
@@ -319,6 +331,57 @@ if __name__ == "__main__":
     recorded = sum(1 for e in phase(events, "B") if e["name"] == "marker_fn")
     assert dropped_events(events) == 0
     assert recorded == 8 * 500, f"expected 4000 calls, recorded {recorded}"
+
+
+def test_no_trace_subprocesses_leaves_a_spawned_child_alone(tmp_path: Path):
+    out = tmp_path / "t.json"
+    run_script(tmp_path, SPAWNING_WORKLOAD, out, flags=("--no-trace-subprocesses",))
+
+    by_pid = names_by_pid(out)
+    assert len(by_pid) == 1, f"expected one process, got {sorted(by_pid)}"
+    assert "parent_work" in next(iter(by_pid.values()))
+    assert "spawned_work" not in slice_names(load(out))
+
+
+def test_no_trace_subprocesses_advertises_nothing_to_children(tmp_path: Path):
+    out = tmp_path / "t.json"
+    stdout = run_script(
+        tmp_path,
+        """
+import os
+print(os.environ.get("TRACE0_CHILD_OUTPUT"))
+""",
+        out,
+        flags=("--no-trace-subprocesses",),
+    )
+    assert stdout.strip() == "None"
+
+
+@FORK_ONLY
+def test_no_trace_subprocesses_still_hands_a_forked_child_a_safe_state(
+    tmp_path: Path,
+):
+    """The child inherits an exporter thread that no longer runs. Leaving it
+    untraced is the point, but it still has to be handed a run that is over
+    rather than one it will block on."""
+    out = tmp_path / "t.json"
+    run_script(tmp_path, FORKING_WORKLOAD, out, flags=("--no-trace-subprocesses",))
+
+    by_pid = names_by_pid(out)
+    assert len(by_pid) == 1, f"expected one process, got {sorted(by_pid)}"
+    assert "only_the_child_calls_this" not in slice_names(load(out))
+
+
+def test_the_python_argument_turns_subprocess_tracing_off(tmp_path: Path):
+    path = tmp_path / "off.json"
+    with Tracer(str(path), format="json", trace_subprocesses=False):
+        subprocess.run(
+            [sys.executable, "-c", "def child_work():\n    return 1\nchild_work()\n"],
+            check=True,
+        )
+    events = load(path)
+    assert "child_work" not in slice_names(events)
+    assert len(pids(events)) == 1
 
 
 def test_nothing_is_traced_once_the_run_is_over(tmp_path: Path):

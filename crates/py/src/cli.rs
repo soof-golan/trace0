@@ -39,6 +39,9 @@ struct RunArgs {
         conflicts_with = "script"
     )]
     module: Vec<String>,
+    /// Trace only this process, leaving the ones it starts alone.
+    #[arg(long)]
+    no_trace_subprocesses: bool,
     /// Python script to run.
     #[arg(required_unless_present = "module")]
     script: Option<String>,
@@ -91,10 +94,14 @@ fn run(py: Python<'_>, a: RunArgs) -> PyResult<i32> {
         output,
         format,
         module,
+        no_trace_subprocesses,
         script,
         script_args,
     } = a;
-    let tracer = Py::new(py, Tracer::new(output, format.as_str().to_string())?)?;
+    let tracer = Py::new(
+        py,
+        Tracer::new(output, format.as_str().to_string(), !no_trace_subprocesses)?,
+    )?;
     let (target, args, argv0) = split_target(module, script, script_args);
 
     let sys = py.import("sys")?;

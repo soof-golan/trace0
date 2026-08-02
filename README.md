@@ -118,6 +118,22 @@ follow one another with a trailing comma and no closing bracket. That is what
 lets several processes append to one array, and it means a process killed
 mid-run still leaves everything up to its last whole entry.
 
+To trace only the process you launched, pass `--no-trace-subprocesses`, or
+`Tracer(..., trace_subprocesses=False)`.
+
+## Being stopped
+
+A run ended by `SIGTERM`, `SIGHUP` or `SIGQUIT` still writes what it recorded.
+The default action for those is to end the process outright — nothing unwinds
+and no `atexit` runs — so trace0 takes them over while tracing, finishes the
+run, then lets the signal do what it was going to do, exit status and all.
+
+Signals the program handles itself are left alone: if it installs its own
+handler, that handler runs and tracing continues. `SIGINT` is untouched,
+because Python already turns it into an exception that unwinds. `SIGKILL`
+cannot be caught, so a run ended that way still loses whatever the exporter
+had not yet drained.
+
 ## Status
 
 Early. The tracer works end to end and is covered by tests, but the API is not

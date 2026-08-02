@@ -14,5 +14,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(tracer::_before_fork, m)?)?;
     m.add_function(wrap_pyfunction!(tracer::_after_fork_in_parent, m)?)?;
     m.add_function(wrap_pyfunction!(tracer::_after_fork_in_child, m)?)?;
+    m.add_function(wrap_pyfunction!(tracer::_handle_deadly_signal, m)?)?;
     Ok(())
 }
