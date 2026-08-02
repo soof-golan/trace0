@@ -121,6 +121,39 @@ mod tests {
         assert_eq!(cache.get(second), None);
     }
 
+    fn hits_alternating(a: usize, b: usize, rounds: u32) -> u32 {
+        let mut cache = CodeCache::EMPTY;
+        let mut hits = 0;
+        for round in 0..rounds {
+            let key = if round % 2 == 0 { a } else { b };
+            if cache.get(key).is_some() {
+                hits += 1;
+            }
+            cache.put(key, round);
+        }
+        hits
+    }
+
+    #[test]
+    fn two_hot_keys_in_one_slot_miss_every_time() {
+        let (first, second) = colliding_pair();
+        assert_eq!(
+            hits_alternating(first, second, 64),
+            0,
+            "one slot per key means two hot keys evict each other forever"
+        );
+
+        let apart = (0x2000_usize..)
+            .step_by(16)
+            .find(|&k| CodeCache::slot_of(k) != CodeCache::slot_of(first))
+            .expect("some key lands in another slot");
+        assert_eq!(
+            hits_alternating(first, apart, 64),
+            62,
+            "the same loop must hit once both keys are warm, or the case above proves nothing"
+        );
+    }
+
     #[test]
     fn distinct_keys_do_not_evict_each_other() {
         let mut cache = CodeCache::EMPTY;
