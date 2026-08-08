@@ -83,6 +83,38 @@ impl Clock {
     pub fn start_ticks(&self) -> u64 {
         self.start_ticks
     }
+
+    pub fn ticks_from_ns(&self, ns: u64) -> u64 {
+        match &self.source {
+            Source::SelfDescribing {
+                nanos_num,
+                nanos_den,
+            } => {
+                let ticks = ns as u128 * *nanos_den as u128 / *nanos_num as u128;
+                self.start_ticks.saturating_add(ticks as u64)
+            }
+            Source::Measured(_) => {
+                let mut span: u64 = 1;
+                while self.ns_since_start(self.start_ticks.saturating_add(span)) < ns {
+                    let Some(doubled) = span.checked_mul(2) else {
+                        return u64::MAX;
+                    };
+                    span = doubled;
+                }
+                let mut lo = self.start_ticks.saturating_add(span / 2);
+                let mut hi = self.start_ticks.saturating_add(span);
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    if self.ns_since_start(mid) < ns {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                lo
+            }
+        }
+    }
 }
 
 fn self_describing_timebase() -> Option<(u64, u64)> {
@@ -183,6 +215,33 @@ mod tests {
             let ns = c.ns_since_start(ticks);
             assert!(ns >= last, "went backwards at {ticks}");
             last = ns;
+        }
+    }
+
+    #[test]
+    fn zero_nanoseconds_map_back_to_the_anchor() {
+        let (c, _m) = Clock::mock_starting_at(10_000);
+        assert_eq!(c.ticks_from_ns(0), 10_000);
+    }
+
+    #[test]
+    fn ticks_from_ns_inverts_ns_since_start() {
+        let (c, _m) = Clock::mock_starting_at(7);
+        for ns in [1u64, 1_000, 250_000_000, 1 << 40] {
+            let ticks = c.ticks_from_ns(ns);
+            assert_eq!(c.ns_since_start(ticks), ns);
+        }
+    }
+
+    #[test]
+    fn a_direct_clock_inverts_within_one_tick() {
+        let c = Clock::starting_now();
+        if !c.is_direct() {
+            return;
+        }
+        for ns in [1u64, 1_000, 250_000_000, 1 << 40] {
+            let round = c.ns_since_start(c.ticks_from_ns(ns));
+            assert!(ns.abs_diff(round) <= 1_000, "{ns}ns came back as {round}ns");
         }
     }
 
