@@ -4,7 +4,7 @@ from typing import Literal, Optional
 
 from trace0._core import Tracer
 
-TraceFormat = Literal["json", "protobuf"]
+TraceFormat = Literal["json", "protobuf", "pprof"]
 
 __all__ = ["Tracer", "TraceFormat", "process_startup"]
 

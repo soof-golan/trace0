@@ -12,6 +12,7 @@ crate-type = ["cdylib"]
 [dependencies]
 trace0-core.workspace = true
 trace0-json.workspace = true
+trace0-pprof.workspace = true
 trace0-proto.workspace = true
 ahash.workspace = true
 clap.workspace = true
