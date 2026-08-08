@@ -47,11 +47,16 @@ fn resolve_cold(
     key: usize,
     hot: &mut trace0_core::tls::Hot,
 ) -> Option<u32> {
+    let generation = crate::codewatch::generation();
     if hot.queue_id != state.run {
         *codes() = CodeCache::EMPTY;
         hot.last_code_key = trace0_core::tls::NOT_CACHED;
         hot.ensured = false;
         hot.name_retries = NAME_RETRIES;
+    }
+    if hot.code_gen != generation {
+        *codes() = CodeCache::EMPTY;
+        hot.code_gen = generation;
     }
     if hot.tid == u32::MAX {
         hot.tid = os_tid();
@@ -89,7 +94,10 @@ fn record(py: Python<'_>, state: &State, code: pyo3::Borrowed<'_, '_, PyAny>, ki
     } else {
         state.queue.clock().raw()
     };
-    let code_id = if hot.last_code_key == key && hot.queue_id == state.run {
+    let code_id = if hot.last_code_key == key
+        && hot.queue_id == state.run
+        && hot.code_gen == crate::codewatch::generation()
+    {
         hot.last_code_id
     } else {
         match resolve_cold(py, state, code, key, hot) {

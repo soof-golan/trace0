@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 
 mod cli;
+mod codewatch;
 mod format;
 mod intern;
 mod monitoring;

@@ -222,6 +222,55 @@ print(hung)
 
 
 @FORK_ONLY
+def test_a_forked_child_can_drop_code_objects_without_its_parents_locks(
+    tmp_path: Path,
+):
+    """A child inherits the registry of live interners, and the parent's
+    interner lock may have been held by an exporter thread that does not
+    exist in the child. Dropping a code object in the child must reach
+    for neither."""
+    out = tmp_path / "t.json"
+    stdout = run_script(
+        tmp_path,
+        """
+import gc, os, sys, time
+
+def noise(n):
+    return sum(i * i for i in range(n))
+
+def churn(rounds):
+    for i in range(rounds):
+        ns = {}
+        exec(f"def ephemeral_{i}(): pass", ns)
+        ns[f"ephemeral_{i}"]()
+        del ns
+        gc.collect()
+
+hung = 0
+for _ in range(80):
+    noise(3000)
+    pid = os.fork()
+    if pid == 0:
+        churn(50)
+        os._exit(0)
+    deadline = time.time() + 10.0
+    while time.time() < deadline:
+        done, _ = os.waitpid(pid, os.WNOHANG)
+        if done:
+            break
+        time.sleep(0.002)
+    else:
+        hung += 1
+        os.kill(pid, 9)
+        os.waitpid(pid, 0)
+print(hung)
+""",
+        out,
+    )
+    assert stdout.strip() == "0", f"{stdout.strip()} forked children hung"
+
+
+@FORK_ONLY
 def test_a_forked_child_keeps_the_events_it_records_just_before_exiting(
     tmp_path: Path,
 ):

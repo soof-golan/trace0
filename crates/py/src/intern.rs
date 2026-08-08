@@ -12,7 +12,6 @@ pub struct Interner {
 struct InternerInner {
     map: AHashMap<usize, u32>,
     info: Vec<CodeInfo>,
-    refs: Vec<Py<PyAny>>,
 }
 
 impl Interner {
@@ -21,7 +20,6 @@ impl Interner {
             inner: RwLock::new(InternerInner {
                 map: AHashMap::new(),
                 info: Vec::new(),
-                refs: Vec::new(),
             }),
         }
     }
@@ -29,6 +27,10 @@ impl Interner {
     #[inline]
     pub fn lookup(&self, key: usize) -> Option<u32> {
         self.inner.read().map.get(&key).copied()
+    }
+
+    pub fn forget(&self, key: usize) -> bool {
+        self.inner.write().map.remove(&key).is_some()
     }
 
     pub fn insert(&self, _py: Python<'_>, code: &Bound<'_, PyAny>, key: usize) -> Option<u32> {
@@ -44,7 +46,6 @@ impl Interner {
             .getattr("co_firstlineno")
             .and_then(|x| x.extract::<u32>())
             .unwrap_or(0);
-        let py_ref = code.clone().unbind();
 
         let mut g = self.inner.write();
         if let Some(&id) = g.map.get(&key) {
@@ -59,7 +60,6 @@ impl Interner {
             filename,
             firstlineno,
         });
-        g.refs.push(py_ref);
         g.map.insert(key, id);
         Some(id)
     }

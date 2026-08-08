@@ -48,6 +48,7 @@ impl Tracer {
             interner: Interner::new(),
             threads: ThreadRegistry::new(),
         });
+        crate::codewatch::watch(py, &state)?;
 
         let sink = self
             .format
@@ -240,6 +241,7 @@ pub fn _after_fork_in_parent(py: Python<'_>) -> PyResult<()> {
 
 #[pyfunction]
 pub fn _after_fork_in_child(py: Python<'_>) -> PyResult<()> {
+    crate::codewatch::forget_watched();
     with_active(|tracer| {
         let mut slot = tracer.running.lock();
         std::mem::forget(slot.take());
