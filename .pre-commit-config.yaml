@@ -25,7 +25,7 @@ repos:
 
       - id: pytest
         name: pytest
-        entry: uv run --python 3.13t pytest -q
+        entry: uv run --python 3.14t pytest -q
         language: system
         files: \.(rs|py|toml|proto)$|^Cargo\.lock$
         pass_filenames: false
