@@ -18,6 +18,14 @@ Repository = "https://github.com/soof-golan/trace0"
 [project.scripts]
 trace0 = "trace0.__main__:main"
 
+[project.optional-dependencies]
+sentry = [
+    "sentry-sdk>=2",
+]
+otel = [
+    "opentelemetry-sdk>=1.20",
+]
+
 [tool.maturin]
 manifest-path = "crates/py/Cargo.toml"
 module-name = "trace0._core"

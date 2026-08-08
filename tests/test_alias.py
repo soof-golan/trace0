@@ -29,3 +29,19 @@ def test_the_alias_offers_the_same_entry_point():
     assert project("alias/tracezero")["scripts"]["tracezero"] == (
         project(".")["scripts"]["trace0"]
     )
+
+
+def test_the_real_package_offers_the_apm_extras():
+    extras = project(".")["optional-dependencies"]
+    assert set(extras) == {"sentry", "otel"}
+    assert any(dep.startswith("sentry-sdk") for dep in extras["sentry"])
+    assert any(dep.startswith("opentelemetry-sdk") for dep in extras["otel"])
+
+
+def test_the_alias_forwards_each_extra_to_the_pinned_real_package():
+    version = project(".")["version"]
+    extras = project("alias/tracezero")["optional-dependencies"]
+    assert extras == {
+        "sentry": [f"trace0[sentry]=={version}"],
+        "otel": [f"trace0[otel]=={version}"],
+    }

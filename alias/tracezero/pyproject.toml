@@ -10,6 +10,10 @@ authors = [
 requires-python = ">=3.13"
 dependencies = ["trace0==0.1.12"]
 
+[project.optional-dependencies]
+sentry = ["trace0[sentry]==0.1.12"]
+otel = ["trace0[otel]==0.1.12"]
+
 [project.urls]
 Homepage = "https://github.com/soof-golan/trace0"
 Repository = "https://github.com/soof-golan/trace0"
