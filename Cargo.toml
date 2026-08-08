@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/core", "crates/json", "crates/pprof", "crates/proto", "crates/py"]
 
 [workspace.package]
-version = "0.1.13"
+version = "0.1.14"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/soof-golan/trace0"

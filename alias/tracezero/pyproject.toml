@@ -1,6 +1,6 @@
 [project]
 name = "tracezero"
-version = "0.1.13"
+version = "0.1.14"
 description = "Alias for trace0, the low-overhead tracing profiler for Python."
 readme = "README.md"
 license = "MIT"
@@ -8,11 +8,11 @@ authors = [
     { name = "Soof Golan", email = "hi@soofgolan.com" }
 ]
 requires-python = ">=3.13"
-dependencies = ["trace0==0.1.13"]
+dependencies = ["trace0==0.1.14"]
 
 [project.optional-dependencies]
-sentry = ["trace0[sentry]==0.1.13"]
-otel = ["trace0[otel]==0.1.13"]
+sentry = ["trace0[sentry]==0.1.14"]
+otel = ["trace0[otel]==0.1.14"]
 
 [project.urls]
 Homepage = "https://github.com/soof-golan/trace0"
