@@ -34,7 +34,6 @@ class Tracer:
     def snapshot(
         self,
         reason: str,
-        slower_than: Optional[str] = None,
         start: Optional[int] = None,
         end: Optional[int] = None,
     ) -> Optional[Snapshot]: ...

@@ -17,20 +17,6 @@ pub(crate) fn next_window() -> u64 {
     NEXT_WINDOW.fetch_add(1, Ordering::Relaxed)
 }
 
-pub(crate) fn parse_duration_ns(text: &str) -> Result<u64, String> {
-    let (number, scale) = match text {
-        t if t.ends_with("ns") => (&t[..t.len() - 2], 1.0),
-        t if t.ends_with("us") => (&t[..t.len() - 2], 1e3),
-        t if t.ends_with("ms") => (&t[..t.len() - 2], 1e6),
-        t if t.ends_with('s') => (&t[..t.len() - 1], 1e9),
-        _ => return Err(format!("duration {text:?} needs a unit: ns, us, ms, or s")),
-    };
-    match number.trim().parse::<f64>() {
-        Ok(value) if value >= 0.0 => Ok((value * scale) as u64),
-        _ => Err(format!("duration {text:?} does not start with a number")),
-    }
-}
-
 pub(crate) struct DirSink {
     pub dir: PathBuf,
     pub format: Format,
@@ -81,7 +67,6 @@ impl DumpSink for DirSink {
 pub struct Snapshot {
     pub(crate) tracer: Py<Tracer>,
     pub(crate) reason: String,
-    pub(crate) slower_than_ns: Option<u64>,
     pub(crate) window: Mutex<Option<(u64, u64)>>,
 }
 
@@ -111,48 +96,28 @@ impl Snapshot {
         let Some((id, start_ticks)) = self.window.lock().take() else {
             return Ok(false);
         };
-        let tagged = match &exc_type {
-            Some(t) => Some(format!(
+        let reason = match &exc_type {
+            Some(t) => format!(
                 "{}-{}",
                 self.reason,
                 t.getattr("__name__")?.extract::<String>()?
-            )),
-            None => None,
+            ),
+            None => self.reason.clone(),
         };
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let mut wants_ack = false;
         self.tracer.get().with_recorder(|running, control| {
-            let clock = running.queue.clock();
-            let end_ticks = clock.raw();
-            let elapsed = clock
-                .ns_since_start(end_ticks)
-                .saturating_sub(clock.ns_since_start(start_ticks));
-            let reason = match tagged {
-                Some(tagged) => Some(tagged),
-                None if self.slower_than_ns.is_some_and(|min| elapsed < min) => None,
-                None => Some(self.reason.clone()),
-            };
-            let msg = match reason {
-                Some(reason) => {
-                    wants_ack = true;
-                    Control::Dump {
-                        id,
-                        start_ticks,
-                        end_ticks,
-                        reason,
-                        done: Some(done_tx),
-                    }
-                }
-                None => Control::Cancel { id },
-            };
             control
-                .send(msg)
+                .send(Control::Dump {
+                    id,
+                    start_ticks,
+                    end_ticks: running.queue.clock().raw(),
+                    reason,
+                    done: Some(done_tx),
+                })
                 .map_err(|_| PyRuntimeError::new_err("the recorder is gone"))
         })?;
-        if wants_ack {
-            py.detach(move || done_rx.recv())
-                .map_err(|_| PyRuntimeError::new_err("the recorder did not finish the dump"))?;
-        }
+        py.detach(move || done_rx.recv())
+            .map_err(|_| PyRuntimeError::new_err("the recorder did not finish the dump"))?;
         Ok(false)
     }
 }

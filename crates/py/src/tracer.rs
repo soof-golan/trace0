@@ -1,7 +1,7 @@
 use crate::format::Format;
 use crate::intern::Interner;
 use crate::monitoring::{self, MonitoringHandle, State};
-use crate::recording::{DirSink, next_window, parse_duration_ns};
+use crate::recording::{DirSink, next_window};
 use crate::threads::ThreadRegistry;
 use parking_lot::Mutex;
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
@@ -412,27 +412,21 @@ impl Tracer {
         Ok(false)
     }
 
-    #[pyo3(signature = (reason, slower_than = None, start = None, end = None))]
+    #[pyo3(signature = (reason, start = None, end = None))]
     fn snapshot(
         slf: &Bound<'_, Self>,
         py: Python<'_>,
         reason: String,
-        slower_than: Option<String>,
         start: Option<u64>,
         end: Option<u64>,
     ) -> PyResult<Py<PyAny>> {
         let me = slf.get();
-        let slower_than_ns = match slower_than {
-            Some(text) => Some(parse_duration_ns(&text).map_err(PyValueError::new_err)?),
-            None => None,
-        };
         match (start, end) {
             (None, None) => {
                 me.with_recorder(|_, _| Ok(()))?;
                 let snapshot = crate::recording::Snapshot {
                     tracer: slf.clone().unbind(),
                     reason,
-                    slower_than_ns,
                     window: Mutex::new(None),
                 };
                 Ok(Py::new(py, snapshot)?.into_any())

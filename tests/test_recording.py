@@ -10,7 +10,6 @@ so a crash or a plain exit still leaves the recent past on disk.
 import gc
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -72,17 +71,6 @@ def test_a_raising_block_dumps_with_the_exception_tag(tmp_path: Path):
     files = dumps_named(out, "risky-ValueError")
     assert len(files) == 1
     assert "inside_marker" in slice_names(load(files[0]))
-
-
-def test_slower_than_keeps_the_slow_and_drops_the_fast(tmp_path: Path):
-    out = tmp_path / "dumps"
-    with recorder(out) as t:
-        with t.snapshot("took-long", slower_than="10ms"):
-            time.sleep(0.05)
-        with t.snapshot("came-back-fast", slower_than="10s"):
-            inside_marker()
-    assert len(dumps_named(out, "took-long")) == 1
-    assert dumps_named(out, "came-back-fast") == []
 
 
 def test_nested_blocks_window_independently(tmp_path: Path):
@@ -167,13 +155,6 @@ def test_a_recorder_that_is_not_running_refuses_snapshots(tmp_path: Path):
         t.snapshot("early")
     with pytest.raises(RuntimeError):
         t.dump("early")
-
-
-def test_a_bad_duration_is_rejected(tmp_path: Path):
-    out = tmp_path / "dumps"
-    with recorder(out) as t:
-        with pytest.raises(ValueError):
-            t.snapshot("x", slower_than="fast")
 
 
 def test_half_a_nanosecond_range_is_rejected(tmp_path: Path):
