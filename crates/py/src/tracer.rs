@@ -156,7 +156,7 @@ impl Tracer {
     }
 }
 
-fn await_dump(py: Python<'_>, written: mpsc::Receiver<()>) -> PyResult<()> {
+fn await_dump(py: Python<'_>, written: mpsc::Receiver<String>) -> PyResult<String> {
     py.detach(move || written.recv())
         .map_err(|_| PyRuntimeError::new_err("the recorder did not finish the dump"))
 }
@@ -428,6 +428,7 @@ impl Tracer {
                     tracer: slf.clone().unbind(),
                     reason,
                     window: Mutex::new(None),
+                    written: Mutex::new(None),
                 };
                 Ok(Py::new(py, snapshot)?.into_any())
             }
@@ -445,14 +446,14 @@ impl Tracer {
                         })
                         .map_err(|_| PyRuntimeError::new_err("the recorder is gone"))
                 })?;
-                await_dump(py, written)?;
-                Ok(py.None())
+                let path = await_dump(py, written)?;
+                Ok(path.into_pyobject(py)?.into_any().unbind())
             }
             _ => Err(PyValueError::new_err("start and end come together")),
         }
     }
 
-    fn dump(&self, py: Python<'_>, reason: String) -> PyResult<()> {
+    fn dump(&self, py: Python<'_>, reason: String) -> PyResult<String> {
         let (done, written) = mpsc::channel();
         self.with_recorder(|running, control| {
             control
@@ -464,5 +465,14 @@ impl Tracer {
                 .map_err(|_| PyRuntimeError::new_err("the recorder is gone"))
         })?;
         await_dump(py, written)
+    }
+
+    fn now_ns(&self) -> PyResult<u64> {
+        let guard = self.running.lock();
+        let running = guard
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("the tracer is not running"))?;
+        let clock = running.queue.clock();
+        Ok(clock.ns_since_start(clock.raw()))
     }
 }

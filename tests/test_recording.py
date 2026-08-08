@@ -141,6 +141,45 @@ def test_a_past_slice_dumps_by_nanosecond_bounds(tmp_path: Path):
     assert "before_marker" in names
 
 
+def test_a_snapshot_block_reports_its_dump_path(tmp_path: Path):
+    out = tmp_path / "dumps"
+    with recorder(out) as t:
+        with t.snapshot("checkout") as snap:
+            assert snap.path is None
+            inside_marker()
+    assert snap.path is not None
+    assert Path(snap.path) == dumps_named(out, "checkout")[0]
+
+
+def test_a_past_slice_returns_its_dump_path(tmp_path: Path):
+    out = tmp_path / "dumps"
+    with recorder(out) as t:
+        before_marker()
+        path = t.snapshot("span", start=0, end=10**15)
+    assert Path(path) == dumps_named(out, "span")[0]
+
+
+def test_dump_returns_its_path(tmp_path: Path):
+    out = tmp_path / "dumps"
+    with recorder(out) as t:
+        before_marker()
+        path = t.dump("manual")
+    assert Path(path) == dumps_named(out, "manual")[0]
+
+
+def test_now_ns_moves_forward_while_the_tracer_runs(tmp_path: Path):
+    with Tracer(str(tmp_path / "t.json"), format="json") as t:
+        first = t.now_ns()
+        second = t.now_ns()
+    assert 0 <= first <= second
+
+
+def test_now_ns_refuses_when_the_tracer_is_not_running(tmp_path: Path):
+    t = Tracer(str(tmp_path / "t.json"), format="json")
+    with pytest.raises(RuntimeError):
+        t.now_ns()
+
+
 def test_a_streaming_tracer_refuses_snapshots(tmp_path: Path):
     with Tracer(str(tmp_path / "t.json"), format="json") as t:
         with pytest.raises(RuntimeError):

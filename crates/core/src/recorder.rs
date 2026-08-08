@@ -24,17 +24,17 @@ pub enum Control {
         start_ticks: u64,
         end_ticks: u64,
         reason: String,
-        done: Option<std::sync::mpsc::Sender<()>>,
+        done: Option<std::sync::mpsc::Sender<String>>,
     },
     DumpAll {
         end_ticks: u64,
         reason: String,
-        done: Option<std::sync::mpsc::Sender<()>>,
+        done: Option<std::sync::mpsc::Sender<String>>,
     },
 }
 
 pub trait DumpSink: Send {
-    fn open(&mut self, reason: &str) -> io::Result<Box<dyn Exporter>>;
+    fn open(&mut self, reason: &str) -> io::Result<(String, Box<dyn Exporter>)>;
 }
 
 pub fn run_recorder(
@@ -145,12 +145,12 @@ impl Recorder {
                 reason,
                 done,
             } => {
-                self.dump(codes, threads, sinks, start_ticks, end_ticks, &reason)?;
+                let path = self.dump(codes, threads, sinks, start_ticks, end_ticks, &reason)?;
                 self.windows.retain(|(window, _)| *window != id);
                 self.refloor();
                 self.update_recycle_floor();
                 if let Some(done) = done {
-                    done.send(()).ok();
+                    done.send(path).ok();
                 }
             }
             Control::DumpAll {
@@ -158,10 +158,10 @@ impl Recorder {
                 reason,
                 done,
             } => {
-                self.dump(codes, threads, sinks, 0, end_ticks, &reason)?;
+                let path = self.dump(codes, threads, sinks, 0, end_ticks, &reason)?;
                 self.update_recycle_floor();
                 if let Some(done) = done {
-                    done.send(()).ok();
+                    done.send(path).ok();
                 }
             }
         }
@@ -176,7 +176,7 @@ impl Recorder {
         start_ticks: u64,
         end_ticks: u64,
         reason: &str,
-    ) -> io::Result<()> {
+    ) -> io::Result<String> {
         self.absorb_all();
         let tails = self.inbound.read_tails();
         self.absorb_all();
@@ -188,12 +188,13 @@ impl Recorder {
             start_ticks,
             end_ticks,
         );
-        let mut exporter = sinks.open(reason)?;
+        let (path, mut exporter) = sinks.open(reason)?;
         for chunk in events.chunks(WRITE_CHUNK) {
             exporter.write_batch(chunk, codes, threads)?;
             self.absorb(usize::MAX);
         }
-        exporter.finish(codes, threads, self.inbound.dropped())
+        exporter.finish(codes, threads, self.inbound.dropped())?;
+        Ok(path)
     }
 }
 
@@ -246,12 +247,13 @@ mod tests {
     struct Factory(Dumps);
 
     impl DumpSink for Factory {
-        fn open(&mut self, reason: &str) -> io::Result<Box<dyn Exporter>> {
-            Ok(Box::new(Collector {
+        fn open(&mut self, reason: &str) -> io::Result<(String, Box<dyn Exporter>)> {
+            let collector = Collector {
                 reason: reason.to_string(),
                 events: Vec::new(),
                 out: self.0.clone(),
-            }))
+            };
+            Ok((format!("dumps/{reason}"), Box::new(collector)))
         }
     }
 
@@ -602,6 +604,22 @@ mod tests {
         s.mock.increment(777u64);
         s.sync();
         assert_eq!(s.queue.recycle_floor(), 777);
+        s.finish();
+    }
+
+    #[test]
+    fn a_dump_acknowledgement_carries_the_written_path() {
+        let s = start(usize::MAX);
+        s.produce(1, vec![(1, EventKind::Begin), (2, EventKind::End)]);
+        let (done, written) = mpsc::channel();
+        s.control
+            .send(Control::DumpAll {
+                end_ticks: 10,
+                reason: "pathed".into(),
+                done: Some(done),
+            })
+            .unwrap();
+        assert_eq!(written.recv().unwrap(), "dumps/pathed");
         s.finish();
     }
 

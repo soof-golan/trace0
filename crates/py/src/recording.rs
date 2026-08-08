@@ -24,7 +24,7 @@ pub(crate) struct DirSink {
 }
 
 impl DumpSink for DirSink {
-    fn open(&mut self, reason: &str) -> io::Result<Box<dyn Exporter>> {
+    fn open(&mut self, reason: &str) -> io::Result<(String, Box<dyn Exporter>)> {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(io::Error::other)?
@@ -56,7 +56,8 @@ impl DumpSink for DirSink {
                 let path = path
                     .to_str()
                     .ok_or_else(|| io::Error::other("the output path is not unicode"))?;
-                return self.format.open(path, self.pid, false);
+                let exporter = self.format.open(path, self.pid, false)?;
+                return Ok((path.to_string(), exporter));
             }
         }
         unreachable!("every serial number was taken")
@@ -68,10 +69,16 @@ pub struct Snapshot {
     pub(crate) tracer: Py<Tracer>,
     pub(crate) reason: String,
     pub(crate) window: Mutex<Option<(u64, u64)>>,
+    pub(crate) written: Mutex<Option<String>>,
 }
 
 #[pymethods]
 impl Snapshot {
+    #[getter]
+    fn path(&self) -> Option<String> {
+        self.written.lock().clone()
+    }
+
     fn __enter__<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, Self>> {
         let me = slf.get();
         me.tracer.get().with_recorder(|running, control| {
@@ -116,8 +123,10 @@ impl Snapshot {
                 })
                 .map_err(|_| PyRuntimeError::new_err("the recorder is gone"))
         })?;
-        py.detach(move || done_rx.recv())
+        let path = py
+            .detach(move || done_rx.recv())
             .map_err(|_| PyRuntimeError::new_err("the recorder did not finish the dump"))?;
+        *self.written.lock() = Some(path);
         Ok(false)
     }
 }
