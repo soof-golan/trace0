@@ -17,13 +17,6 @@ pub(crate) fn backoff(idle: &mut Duration) {
     *idle = (*idle * 2).min(IDLE_MAX);
 }
 
-fn ship(full: &mut rtrb::Producer<Box<EventBatch>>, batch: Box<EventBatch>, dropped: &mut u64) {
-    let events = batch.events.len() as u64;
-    if full.push(batch).is_err() {
-        *dropped += events;
-    }
-}
-
 struct Writer<'a> {
     clock: &'a Clock,
     codes: &'a dyn CodeLookup,
@@ -57,33 +50,30 @@ pub fn run_pipeline(
         thread::Builder::new()
             .name("trace0-serializer".into())
             .spawn(move || {
-                let mut dropped: u64 = 0;
                 let mut idle = IDLE_MIN;
                 let mut batches: Vec<Box<EventBatch>> = Vec::new();
                 loop {
+                    if full_tx.is_abandoned() {
+                        return;
+                    }
+                    let room = full_tx.slots();
+                    if room == 0 {
+                        backoff(&mut idle);
+                        continue;
+                    }
                     batches.clear();
-                    if inbound.drain_batches(&mut batches, FANIN_BATCHES) == 0 {
+                    if inbound.drain_batches(&mut batches, room) == 0 {
                         if inbound.is_closed() {
-                            break;
+                            return;
                         }
                         backoff(&mut idle);
                         continue;
                     }
                     idle = IDLE_MIN;
                     for batch in batches.drain(..) {
-                        ship(&mut full_tx, batch, &mut dropped);
+                        full_tx.push(batch).expect("sized to the open slots");
                     }
                 }
-                loop {
-                    batches.clear();
-                    if inbound.drain_batches(&mut batches, usize::MAX) == 0 {
-                        break;
-                    }
-                    for batch in batches.drain(..) {
-                        ship(&mut full_tx, batch, &mut dropped);
-                    }
-                }
-                dropped
             })
             .map_err(io::Error::other)?
     };
@@ -117,11 +107,10 @@ pub fn run_pipeline(
         }
     }
 
-    let fanin_dropped = serializer
+    serializer
         .join()
         .map_err(|_| io::Error::other("serializer panicked"))?;
-    let total_dropped = inbound.dropped() + fanin_dropped;
-    exporter.finish(codes.as_ref(), threads.as_ref(), total_dropped)?;
+    exporter.finish(codes.as_ref(), threads.as_ref(), inbound.dropped())?;
     Ok(())
 }
 
@@ -240,6 +229,93 @@ mod tests {
         );
         assert_eq!(seen.dropped, Some(queue.dropped()));
         assert_eq!(seen.events.len() as u64 + queue.dropped(), n as u64);
+    }
+
+    struct Gated {
+        release: std::sync::mpsc::Receiver<()>,
+        open: bool,
+        seen: Arc<Mutex<Recording>>,
+    }
+
+    impl Exporter for Gated {
+        fn write_batch(
+            &mut self,
+            events: &[Event],
+            _: &dyn CodeLookup,
+            _: &dyn ThreadNames,
+        ) -> io::Result<()> {
+            if !self.open {
+                self.release.recv().map_err(io::Error::other)?;
+                self.open = true;
+            }
+            self.seen.lock().events.extend_from_slice(events);
+            Ok(())
+        }
+
+        fn finish(
+            &mut self,
+            _: &dyn CodeLookup,
+            _: &dyn ThreadNames,
+            dropped: u64,
+        ) -> io::Result<()> {
+            self.seen.lock().dropped = Some(dropped);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_stalled_writer_never_costs_a_thread_its_only_batch() {
+        let queue = queue();
+        let seen = Arc::new(Mutex::new(Recording::default()));
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let pipeline = {
+            let queue = queue.clone();
+            let seen = seen.clone();
+            thread::spawn(move || {
+                run_pipeline(
+                    queue,
+                    Arc::new(CodeTable::new()),
+                    Arc::new(ThreadTable::new()),
+                    Box::new(Gated {
+                        release: gate,
+                        open: false,
+                        seen,
+                    }),
+                )
+                .unwrap()
+            })
+        };
+        {
+            let queue = queue.clone();
+            thread::spawn(move || {
+                let hot = hot();
+                for i in 0..400 * BATCH_N {
+                    queue.push_with_ctx(hot, queue.id(), i as u64, 7, 0, EventKind::Begin);
+                }
+            })
+            .join()
+            .unwrap();
+        }
+        {
+            let queue = queue.clone();
+            thread::spawn(move || {
+                let hot = hot();
+                for i in 0..5u64 {
+                    queue.push_with_ctx(hot, queue.id(), i, 3, 7, EventKind::Begin);
+                }
+            })
+            .join()
+            .unwrap();
+        }
+        queue.close();
+        thread::sleep(Duration::from_millis(200));
+        release.send(()).unwrap();
+        pipeline.join().unwrap();
+        let recording = seen.lock();
+        assert!(
+            recording.events.iter().any(|e| e.tid == 3),
+            "the quiet thread's only batch was dropped at the fanin"
+        );
     }
 
     #[test]
