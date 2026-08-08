@@ -1,5 +1,7 @@
+use crate::clock::Clock;
 use crate::event::Event;
-use crate::evqueue::EventQueue;
+use crate::evqueue::{BATCH_N, EventBatch, EventQueue};
+use crate::ring::Ring;
 use crate::sink::{CodeLookup, Exporter, ThreadNames};
 use std::io;
 use std::sync::Arc;
@@ -7,7 +9,6 @@ use std::thread;
 use std::time::Duration;
 
 const FANIN_BATCHES: usize = 256;
-const BATCH: usize = 4096;
 const IDLE_MIN: Duration = Duration::from_micros(20);
 const IDLE_MAX: Duration = Duration::from_micros(200);
 
@@ -16,18 +17,30 @@ fn backoff(idle: &mut Duration) {
     *idle = (*idle * 2).min(IDLE_MAX);
 }
 
-fn ship(
-    full: &mut rtrb::Producer<Vec<Event>>,
-    spent: &mut rtrb::Consumer<Vec<Event>>,
-    batch: Vec<Event>,
-    dropped: &mut u64,
-) -> Vec<Event> {
-    match full.push(batch) {
-        Ok(()) => spent.pop().unwrap_or_else(|_| Vec::with_capacity(BATCH)),
-        Err(rtrb::PushError::Full(lost)) => {
-            *dropped += lost.len() as u64;
-            lost
+fn ship(full: &mut rtrb::Producer<Box<EventBatch>>, batch: Box<EventBatch>, dropped: &mut u64) {
+    let events = batch.events.len() as u64;
+    if full.push(batch).is_err() {
+        *dropped += events;
+    }
+}
+
+struct Writer<'a> {
+    clock: &'a Clock,
+    codes: &'a dyn CodeLookup,
+    threads: &'a dyn ThreadNames,
+    exporter: &'a mut dyn Exporter,
+    decoded: Vec<Event>,
+}
+
+impl Writer<'_> {
+    fn drain(&mut self, ring: &mut Ring) -> io::Result<()> {
+        while let Some(batch) = ring.pop() {
+            self.decoded.clear();
+            batch.decode_into(self.clock, &mut self.decoded);
+            self.exporter
+                .write_batch(&self.decoded, self.codes, self.threads)?;
         }
+        Ok(())
     }
 }
 
@@ -37,8 +50,7 @@ pub fn run_pipeline(
     threads: Arc<dyn ThreadNames>,
     mut exporter: Box<dyn Exporter>,
 ) -> io::Result<()> {
-    let (mut full_tx, mut full_rx) = rtrb::RingBuffer::<Vec<Event>>::new(FANIN_BATCHES);
-    let (mut spent_tx, mut spent_rx) = rtrb::RingBuffer::<Vec<Event>>::new(FANIN_BATCHES);
+    let (mut full_tx, mut full_rx) = rtrb::RingBuffer::<Box<EventBatch>>::new(FANIN_BATCHES);
 
     let serializer = {
         let inbound = inbound.clone();
@@ -47,10 +59,10 @@ pub fn run_pipeline(
             .spawn(move || {
                 let mut dropped: u64 = 0;
                 let mut idle = IDLE_MIN;
-                let mut batch: Vec<Event> = Vec::with_capacity(BATCH);
+                let mut batches: Vec<Box<EventBatch>> = Vec::new();
                 loop {
-                    batch.clear();
-                    if inbound.drain_nonblocking(&mut batch, BATCH) == 0 {
+                    batches.clear();
+                    if inbound.drain_batches(&mut batches, FANIN_BATCHES) == 0 {
                         if inbound.is_closed() {
                             break;
                         }
@@ -58,33 +70,46 @@ pub fn run_pipeline(
                         continue;
                     }
                     idle = IDLE_MIN;
-                    batch = ship(&mut full_tx, &mut spent_rx, batch, &mut dropped);
+                    for batch in batches.drain(..) {
+                        ship(&mut full_tx, batch, &mut dropped);
+                    }
                 }
                 loop {
-                    batch.clear();
-                    if inbound.drain_nonblocking(&mut batch, BATCH) == 0 {
+                    batches.clear();
+                    if inbound.drain_batches(&mut batches, usize::MAX) == 0 {
                         break;
                     }
-                    batch = ship(&mut full_tx, &mut spent_rx, batch, &mut dropped);
+                    for batch in batches.drain(..) {
+                        ship(&mut full_tx, batch, &mut dropped);
+                    }
                 }
                 dropped
             })
             .map_err(io::Error::other)?
     };
 
+    let mut ring = Ring::new(usize::MAX);
+    let mut writer = Writer {
+        clock: inbound.clock(),
+        codes: codes.as_ref(),
+        threads: threads.as_ref(),
+        exporter: exporter.as_mut(),
+        decoded: Vec::with_capacity(BATCH_N),
+    };
     let mut idle = IDLE_MIN;
     loop {
         match full_rx.pop() {
             Ok(batch) => {
                 idle = IDLE_MIN;
-                exporter.write_batch(&batch, codes.as_ref(), threads.as_ref())?;
-                let _ = spent_tx.push(batch);
+                ring.push(batch);
+                writer.drain(&mut ring)?;
             }
             Err(_) => {
                 if serializer.is_finished() {
                     while let Ok(batch) = full_rx.pop() {
-                        exporter.write_batch(&batch, codes.as_ref(), threads.as_ref())?;
+                        ring.push(batch);
                     }
+                    writer.drain(&mut ring)?;
                     break;
                 }
                 backoff(&mut idle);

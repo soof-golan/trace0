@@ -4,6 +4,7 @@ pub mod event;
 pub mod evqueue;
 pub mod output;
 pub mod pipeline;
+pub mod ring;
 pub mod sink;
 pub mod tls;
 
@@ -12,4 +13,5 @@ pub use event::{Event, EventKind, PackedEvent, os_tid};
 pub use evqueue::EventQueue;
 pub use output::SharedFile;
 pub use pipeline::run_pipeline;
+pub use ring::Ring;
 pub use sink::{CodeInfo, CodeLookup, CodeTable, Exporter, ThreadNames, ThreadTable};

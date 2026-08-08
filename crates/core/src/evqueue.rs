@@ -1,10 +1,9 @@
 use crate::clock::Clock;
 use crate::event::{Event, EventKind, PackedEvent, pack_code_kind};
 use crate::tls::{COLD, Cold, Hot};
-use parking_lot::{Condvar, Mutex};
+use parking_lot::Mutex;
 use rtrb::{Consumer, RingBuffer};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::time::Duration;
 
 pub const BATCH_N: usize = 1024;
 pub const BATCHES_CAPACITY: usize = 64;
@@ -26,6 +25,23 @@ impl EventBatch {
             events: Vec::with_capacity(cap),
         }
     }
+
+    pub fn bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.events.capacity() * std::mem::size_of::<PackedEvent>()
+    }
+
+    pub fn decode_into(&self, clock: &Clock, out: &mut Vec<Event>) {
+        out.extend(
+            self.events
+                .iter()
+                .map(|p| Event::from_packed(clock, self.base_ticks, self.tid, *p)),
+        );
+    }
+
+    pub fn end_ticks(&self) -> u64 {
+        let last_delta = self.events.last().map_or(0, |e| e.delta_ticks as u64);
+        self.base_ticks + last_delta
+    }
 }
 
 const CACHE_LINE: usize = 64;
@@ -36,8 +52,6 @@ struct Shared {
     next_consumer: AtomicUsize,
     dropped: AtomicU64,
     closed: AtomicBool,
-    wake_lock: Mutex<()>,
-    wake_cv: Condvar,
 }
 
 pub struct EventQueue {
@@ -61,8 +75,6 @@ impl EventQueue {
                 next_consumer: AtomicUsize::new(0),
                 dropped: AtomicU64::new(0),
                 closed: AtomicBool::new(false),
-                wake_lock: Mutex::new(()),
-                wake_cv: Condvar::new(),
             },
         }
     }
@@ -161,19 +173,7 @@ impl EventQueue {
         cold.arm(hot);
     }
 
-    #[inline]
-    fn decode_into(&self, batch: &EventBatch, out: &mut Vec<Event>) {
-        let base = batch.base_ticks;
-        let tid = batch.tid;
-        out.extend(
-            batch
-                .events
-                .iter()
-                .map(|p| Event::from_packed(&self.clock, base, tid, *p)),
-        );
-    }
-
-    pub fn drain_nonblocking(&self, out: &mut Vec<Event>, limit: usize) -> usize {
+    pub fn drain_batches(&self, out: &mut Vec<Box<EventBatch>>, limit: usize) -> usize {
         let mut consumers = self.shared.consumers.lock();
         let n = consumers.len();
         if n == 0 {
@@ -184,8 +184,8 @@ impl EventQueue {
         for i in 0..n {
             let c = &mut consumers[(start + i) % n];
             while let Ok(batch) = c.pop() {
-                got += batch.events.len();
-                self.decode_into(&batch, out);
+                got += 1;
+                out.push(batch);
                 if got >= limit {
                     return got;
                 }
@@ -198,47 +198,6 @@ impl EventQueue {
         self.shared.closed.load(Ordering::Acquire)
     }
 
-    pub fn drain_blocking(&self, out: &mut Vec<Event>) -> bool {
-        loop {
-            let mut got = 0;
-            {
-                let mut consumers = self.shared.consumers.lock();
-                let n = consumers.len();
-                let start = if n == 0 {
-                    0
-                } else {
-                    self.shared.next_consumer.fetch_add(1, Ordering::Relaxed) % n
-                };
-                'outer: for i in 0..n {
-                    let c = &mut consumers[(start + i) % n];
-                    while let Ok(batch) = c.pop() {
-                        got += batch.events.len();
-                        self.decode_into(&batch, out);
-                        if got >= 4096 {
-                            break 'outer;
-                        }
-                    }
-                }
-            }
-            if got > 0 {
-                return true;
-            }
-            if self.shared.closed.load(Ordering::Acquire) {
-                let mut consumers = self.shared.consumers.lock();
-                for c in consumers.iter_mut() {
-                    while let Ok(batch) = c.pop() {
-                        self.decode_into(&batch, out);
-                    }
-                }
-                return !out.is_empty();
-            }
-            let mut g = self.shared.wake_lock.lock();
-            self.shared
-                .wake_cv
-                .wait_for(&mut g, Duration::from_millis(20));
-        }
-    }
-
     pub fn dropped(&self) -> u64 {
         self.shared.dropped.load(Ordering::Relaxed)
     }
@@ -249,8 +208,6 @@ impl EventQueue {
 
     pub fn close(&self) {
         self.shared.closed.store(true, Ordering::Release);
-        let _g = self.shared.wake_lock.lock();
-        self.shared.wake_cv.notify_all();
     }
 }
 
@@ -263,6 +220,16 @@ mod tests {
         Clock::mock().0
     }
 
+    fn drain_events(q: &EventQueue, limit_batches: usize) -> Vec<Event> {
+        let mut batches = Vec::new();
+        q.drain_batches(&mut batches, limit_batches);
+        let mut out = Vec::new();
+        for batch in &batches {
+            batch.decode_into(q.clock(), &mut out);
+        }
+        out
+    }
+
     fn push_and_drain(clock: Clock, pushes: Vec<(u64, u32, u32, EventKind)>) -> Vec<Event> {
         std::thread::spawn(move || {
             let q = EventQueue::new(clock);
@@ -271,9 +238,7 @@ mod tests {
                 q.push_with_ctx(hot, q.id(), ticks, tid, code, kind);
             }
             COLD.with_borrow_mut(|cold| cold.flush_partial(hot));
-            let mut out = Vec::new();
-            q.drain_nonblocking(&mut out, usize::MAX);
-            out
+            drain_events(&q, usize::MAX)
         })
         .join()
         .unwrap()
@@ -295,10 +260,8 @@ mod tests {
             .unwrap();
         }
 
-        let mut first = Vec::new();
-        q.drain_nonblocking(&mut first, BATCH_N);
-        let mut second = Vec::new();
-        q.drain_nonblocking(&mut second, BATCH_N);
+        let first = drain_events(&q, 1);
+        let second = drain_events(&q, 1);
 
         assert!(first.iter().all(|e| e.tid == 1), "the backlog drains first");
         assert!(
@@ -314,16 +277,13 @@ mod tests {
             let first = EventQueue::new(test_clock());
             first.push_with_ctx(hot, first.id(), 10, 1, 7, EventKind::Begin);
             COLD.with_borrow_mut(|cold| cold.flush_partial(hot));
-            let mut discard = Vec::new();
-            first.drain_nonblocking(&mut discard, usize::MAX);
+            drain_events(&first, usize::MAX);
             first.close();
 
             let second = EventQueue::new(test_clock());
             second.push_with_ctx(hot, second.id(), 20, 1, 7, EventKind::End);
             COLD.with_borrow_mut(|cold| cold.flush_partial(hot));
-            let mut out = Vec::new();
-            second.drain_nonblocking(&mut out, usize::MAX);
-            out
+            drain_events(&second, usize::MAX)
         })
         .join()
         .unwrap();
@@ -357,9 +317,7 @@ mod tests {
                 q.push_with_ctx(hot, wrong, i * 1_000, 1, 3, EventKind::Begin);
             }
             COLD.with_borrow_mut(|cold| cold.flush_partial(hot));
-            let mut out = Vec::new();
-            q.drain_nonblocking(&mut out, usize::MAX);
-            out
+            drain_events(&q, usize::MAX)
         })
         .join()
         .unwrap();
@@ -378,9 +336,7 @@ mod tests {
                 q.push_with_ctx(hot, q.id(), i as u64, 1, 0, EventKind::Begin);
             }
             q.record_dropped(COLD.with_borrow_mut(|cold| cold.flush_partial(hot)));
-            let mut out = Vec::new();
-            q.drain_nonblocking(&mut out, usize::MAX);
-            (out.len() as u64, q.dropped())
+            (drain_events(&q, usize::MAX).len() as u64, q.dropped())
         })
         .join()
         .unwrap();
