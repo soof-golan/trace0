@@ -58,12 +58,10 @@ jobs:
       fail-fast: false
       matrix:
         runner: [macos-15-intel, macos-latest]
-        python: ["3.13", "3.13t", "3.14", "3.14t"]
+        python: ["3.13", "3.14", "3.14t"]
         include:
           - python: "3.13"
             abi: cp313-cp313
-          - python: "3.13t"
-            abi: cp313-cp313t
           - python: "3.14"
             abi: cp314-cp314
           - python: "3.14t"

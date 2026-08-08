@@ -62,10 +62,10 @@ The traced script runs *inside* the tracer's environment, so name what it
 imports with `--with`, and the interpreter with `--python`:
 
 ```bash
-uvx --with httpx --python 3.13t trace0 run --output trace.pb your_script.py
+uvx --with httpx --python 3.14t trace0 run --output trace.pb your_script.py
 ```
 
-Free-threaded builds (3.13t, 3.14t) are a first-class target — every thread is
+Free-threaded builds (3.14t) are a first-class target — every thread is
 traced, not just the calling one.
 
 `-m` runs a library module, exactly as `python -m` does; everything after the
