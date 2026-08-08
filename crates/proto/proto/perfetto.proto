@@ -30,6 +30,13 @@ message TrackEventDefaults {
 message InternedData {
   repeated EventCategory event_categories = 1;
   repeated EventName event_names = 2;
+  repeated SourceLocation source_locations = 4;
+}
+
+message SourceLocation {
+  optional uint64 iid = 1;
+  optional string file_name = 2;
+  optional uint32 line_number = 4;
 }
 
 message EventCategory {
@@ -73,4 +80,5 @@ message TrackEvent {
   optional uint64 name_iid = 10;
   optional string name = 23;
   repeated string categories = 22;
+  optional uint64 source_location_iid = 34;
 }

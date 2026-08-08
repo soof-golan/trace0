@@ -19,6 +19,12 @@ mod tag {
     pub const NAME_IID: u8 = 10 << 3;
     pub const SEQUENCE_FLAGS: u8 = 13 << 3;
     pub const SEQUENCE_ID: u8 = 10 << 3;
+
+    const SOURCE_LOCATION: u16 = 34 << 3;
+    pub const SOURCE_LOCATION_IID: [u8; 2] = [
+        (SOURCE_LOCATION & 0x7f) as u8 | 0x80,
+        (SOURCE_LOCATION >> 7) as u8,
+    ];
 }
 
 const SEQ_INCREMENTAL_STATE_CLEARED: u32 = 1;
@@ -31,7 +37,7 @@ const CATEGORY_IID: u64 = 1;
 struct Sequence {
     id: u32,
     header: Vec<u8>,
-    name_iids: ahash::AHashMap<u32, u64>,
+    code_iids: ahash::AHashMap<u32, (u64, bool)>,
 }
 
 const SEQUENCES_PER_SLOT: u32 = 128;
@@ -104,16 +110,32 @@ impl<W: Write + Send> ProtoExporter<W> {
         self.out.write_all(&self.scratch)
     }
 
-    fn name_iid(&mut self, tid: u32, code_id: u32, codes: &dyn CodeLookup) -> io::Result<u64> {
+    fn code_iid(
+        &mut self,
+        tid: u32,
+        code_id: u32,
+        codes: &dyn CodeLookup,
+    ) -> io::Result<(u64, bool)> {
         let seq = &self.sequences[&tid];
-        if let Some(&iid) = seq.name_iids.get(&code_id) {
-            return Ok(iid);
+        if let Some(&entry) = seq.code_iids.get(&code_id) {
+            return Ok(entry);
         }
-        let (iid, seq_id) = (seq.name_iids.len() as u64 + 1, seq.id);
-        let name = codes
-            .code(code_id)
-            .map(|i| i.qualname)
+        let (iid, seq_id) = (seq.code_iids.len() as u64 + 1, seq.id);
+        let info = codes.code(code_id);
+        let name = info
+            .as_ref()
+            .map(|i| i.qualname.clone())
             .unwrap_or_else(|| "<unknown>".into());
+        let source_locations: Vec<pb::SourceLocation> = info
+            .map(|i| {
+                vec![pb::SourceLocation {
+                    iid: Some(iid),
+                    file_name: Some(i.filename),
+                    line_number: Some(i.firstlineno),
+                }]
+            })
+            .unwrap_or_default();
+        let has_location = !source_locations.is_empty();
         self.write_packet(&pb::TracePacket {
             timestamp: Some(0),
             trusted_packet_sequence_id: Some(seq_id),
@@ -125,15 +147,16 @@ impl<W: Write + Send> ProtoExporter<W> {
                     name: Some(name),
                 }],
                 event_categories: vec![],
+                source_locations,
             }),
             data: None,
         })?;
         self.sequences
             .get_mut(&tid)
             .expect("sequence exists")
-            .name_iids
-            .insert(code_id, iid);
-        Ok(iid)
+            .code_iids
+            .insert(code_id, (iid, has_location));
+        Ok((iid, has_location))
     }
 
     fn template(
@@ -157,11 +180,15 @@ impl<W: Write + Send> ProtoExporter<W> {
             pb::track_event::Type::SliceEnd as u8
         });
         if opens {
-            let name_iid = self.name_iid(tid, code_id, codes)?;
+            let (iid, has_location) = self.code_iid(tid, code_id, codes)?;
             event.push(tag::CATEGORY_IIDS);
             event.extend_from_slice(Varint::of(CATEGORY_IID).as_slice());
             event.push(tag::NAME_IID);
-            event.extend_from_slice(Varint::of(name_iid).as_slice());
+            event.extend_from_slice(Varint::of(iid).as_slice());
+            if has_location {
+                event.extend_from_slice(&tag::SOURCE_LOCATION_IID);
+                event.extend_from_slice(Varint::of(iid).as_slice());
+            }
         }
 
         let start = self.template_bytes.len() as u32;
@@ -255,6 +282,7 @@ impl<W: Write + Send> ProtoExporter<W> {
                     name: Some(CATEGORY.into()),
                 }],
                 event_names: vec![],
+                source_locations: vec![],
             }),
             data: Some(pb::trace_packet::Data::TrackDescriptor(
                 pb::TrackDescriptor {
@@ -275,7 +303,7 @@ impl<W: Write + Send> ProtoExporter<W> {
             Sequence {
                 id,
                 header,
-                name_iids: ahash::AHashMap::new(),
+                code_iids: ahash::AHashMap::new(),
             },
         );
         Ok(())
@@ -350,6 +378,7 @@ impl<W: Write + Send> Exporter for ProtoExporter<W> {
                     categories: vec!["py".into(), "dropped".into()],
                     category_iids: vec![],
                     name_iid: None,
+                    source_location_iid: None,
                 })),
             };
             self.write_packet(&pkt)?;
@@ -427,6 +456,25 @@ mod tests {
                     .iter()
                     .flat_map(|d| d.event_names.iter())
                     .map(move |n| ((seq, n.iid.unwrap()), n.name.clone().unwrap()))
+            })
+            .collect()
+    }
+
+    fn interned_locations(
+        pkts: &[pb::TracePacket],
+    ) -> std::collections::HashMap<(u32, u64), (String, u32)> {
+        pkts.iter()
+            .flat_map(|p| {
+                let seq = p.trusted_packet_sequence_id.unwrap();
+                p.interned_data
+                    .iter()
+                    .flat_map(|d| d.source_locations.iter())
+                    .map(move |l| {
+                        (
+                            (seq, l.iid.unwrap()),
+                            (l.file_name.clone().unwrap(), l.line_number.unwrap()),
+                        )
+                    })
             })
             .collect()
     }
@@ -550,6 +598,47 @@ mod tests {
         assert_eq!(end.name_iid, None);
         assert!(end.category_iids.is_empty());
         assert!(end.track_uuid.is_none());
+        assert_eq!(end.source_location_iid, None);
+    }
+
+    #[test]
+    fn a_slice_begin_points_at_its_file_and_line() {
+        let raw = export(
+            &[Event::new(0, 1, 0, EventKind::Begin)],
+            &fib_table(),
+            &ThreadTable::new(),
+            0,
+        );
+        let pkts = packets(&raw);
+        let (seq, te) = events_by_sequence(&pkts)[0];
+        let key = (seq, te.source_location_iid.expect("no source location"));
+        assert_eq!(interned_locations(&pkts)[&key], ("demo.py".to_string(), 12));
+    }
+
+    #[test]
+    fn a_repeated_location_is_written_once() {
+        let events: Vec<_> = (0..500)
+            .map(|i| Event::new(i * 10, 7, 0, EventKind::Begin))
+            .collect();
+        let raw = export(&events, &fib_table(), &ThreadTable::new(), 0);
+        let pkts = packets(&raw);
+        assert_eq!(interned_locations(&pkts).len(), 1);
+        let occurrences = raw.windows(7).filter(|w| *w == b"demo.py").count();
+        assert_eq!(occurrences, 1, "file name repeated in the encoded stream");
+    }
+
+    #[test]
+    fn an_unresolvable_code_has_no_source_location() {
+        let raw = export(
+            &[Event::new(0, 1, 999, EventKind::Begin)],
+            &CodeTable::new(),
+            &ThreadTable::new(),
+            0,
+        );
+        let pkts = packets(&raw);
+        let (_, te) = events_by_sequence(&pkts)[0];
+        assert_eq!(te.source_location_iid, None);
+        assert!(interned_locations(&pkts).is_empty());
     }
 
     #[test]
