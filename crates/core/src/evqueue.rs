@@ -62,6 +62,7 @@ struct Shared {
 pub struct EventQueue {
     id: u64,
     clock: Clock,
+    recycle_floor: AtomicU64,
     shared: Shared,
 }
 
@@ -75,6 +76,7 @@ impl EventQueue {
         Self {
             id: NEXT_QUEUE_ID.fetch_add(1, Ordering::Relaxed),
             clock,
+            recycle_floor: AtomicU64::new(0),
             shared: Shared {
                 consumers: Mutex::new(Vec::new()),
                 next_consumer: AtomicUsize::new(0),
@@ -86,6 +88,14 @@ impl EventQueue {
 
     pub fn clock(&self) -> &Clock {
         &self.clock
+    }
+
+    pub fn recycle_floor(&self) -> u64 {
+        self.recycle_floor.load(Ordering::Acquire)
+    }
+
+    pub fn set_recycle_floor(&self, floor: u64) {
+        self.recycle_floor.store(floor, Ordering::Release);
     }
 
     #[inline]

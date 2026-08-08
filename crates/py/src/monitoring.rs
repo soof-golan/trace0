@@ -69,10 +69,11 @@ fn resolve_cold(
     let id = match codes().get(key) {
         Some(id) => id,
         None => {
-            let id = state
-                .interner
-                .lookup(key)
-                .or_else(|| state.interner.insert(py, &code, key))?;
+            let id = state.interner.lookup(key).or_else(|| {
+                state
+                    .interner
+                    .insert(py, &code, key, state.queue.recycle_floor())
+            })?;
             codes().put(key, id);
             id
         }

@@ -9,6 +9,7 @@ use std::sync::mpsc::Receiver;
 
 const DRAIN_LIMIT: usize = 256;
 const WRITE_CHUNK: usize = 4096;
+const FLOOR_EVERY: u32 = 1024;
 
 pub enum Control {
     Open {
@@ -51,11 +52,17 @@ pub fn run_recorder(
         batches: Vec::new(),
     };
     let mut idle = IDLE_MIN;
+    let mut ticker = 0u32;
     loop {
         let mut worked = false;
         while let Ok(msg) = control.try_recv() {
             worked = true;
             recorder.handle(msg, codes.as_ref(), threads.as_ref(), sinks.as_mut())?;
+        }
+        ticker += 1;
+        if ticker == FLOOR_EVERY {
+            ticker = 0;
+            recorder.update_recycle_floor();
         }
         if recorder.absorb(DRAIN_LIMIT) > 0 {
             worked = true;
@@ -101,6 +108,20 @@ impl Recorder {
         self.ring.set_floor(floor);
     }
 
+    fn update_recycle_floor(&mut self) {
+        let now = self.inbound.clock().raw();
+        let tails = self.inbound.read_tails();
+        self.absorb_all();
+        let oldest_tail = tails.iter().map(|t| t.base_ticks).min();
+        let oldest_batch = self.ring.iter().map(|b| b.base_ticks).min();
+        let floor = [Some(now), oldest_tail, oldest_batch]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap();
+        self.inbound.set_recycle_floor(floor);
+    }
+
     fn handle(
         &mut self,
         msg: Control,
@@ -127,6 +148,7 @@ impl Recorder {
                 self.dump(codes, threads, sinks, start_ticks, end_ticks, &reason)?;
                 self.windows.retain(|(window, _)| *window != id);
                 self.refloor();
+                self.update_recycle_floor();
                 if let Some(done) = done {
                     done.send(()).ok();
                 }
@@ -137,6 +159,7 @@ impl Recorder {
                 done,
             } => {
                 self.dump(codes, threads, sinks, 0, end_ticks, &reason)?;
+                self.update_recycle_floor();
                 if let Some(done) = done {
                     done.send(()).ok();
                 }
@@ -238,10 +261,12 @@ mod tests {
         dumps: Dumps,
         recorder: thread::JoinHandle<io::Result<()>>,
         syncs: u64,
+        mock: Arc<crate::clock::Mock>,
     }
 
     fn start(capacity_bytes: usize) -> Session {
-        let queue = Arc::new(EventQueue::new(Clock::mock().0));
+        let (clock, mock) = Clock::mock();
+        let queue = Arc::new(EventQueue::new(clock));
         let (control, rx) = mpsc::channel();
         let dumps: Dumps = Arc::new(Mutex::new(Vec::new()));
         let recorder = {
@@ -267,6 +292,7 @@ mod tests {
             dumps,
             recorder,
             syncs: 0,
+            mock,
         }
     }
 
@@ -298,14 +324,15 @@ mod tests {
         fn sync(&mut self) {
             self.syncs += 1;
             let reason = format!("sync-{}", self.syncs);
+            let (done, written) = mpsc::channel();
             self.control
                 .send(Control::DumpAll {
                     end_ticks: 0,
-                    reason: reason.clone(),
-                    done: None,
+                    reason,
+                    done: Some(done),
                 })
                 .unwrap();
-            self.wait_for(&reason);
+            written.recv().unwrap();
         }
 
         fn finish(self) -> Vec<(String, Vec<Event>)> {
@@ -537,6 +564,45 @@ mod tests {
             timestamps(&dumps[0].1),
             Vec::from_iter(1..=2 * WRITE_CHUNK as u64)
         );
+    }
+
+    #[test]
+    fn a_dump_publishes_the_recycle_floor() {
+        let mut s = start(2 * full_batch());
+        s.produce(1, begins(1..=4 * BATCH_N as u64));
+        s.mock.increment(1_000_000u64);
+        s.sync();
+        assert_eq!(s.queue.recycle_floor(), 2 * BATCH_N as u64 + 1);
+        s.finish();
+    }
+
+    #[test]
+    fn a_live_tail_holds_the_recycle_floor_down() {
+        let mut s = start(usize::MAX);
+        let (go, producer, ready) = {
+            let queue = s.queue.clone();
+            hold_after(move || {
+                let hot = hot();
+                queue.push_with_ctx(hot, queue.id(), 5, 3, 7, EventKind::Begin);
+                queue.push_with_ctx(hot, queue.id(), 6, 3, 7, EventKind::End);
+            })
+        };
+        ready.recv().unwrap();
+        s.mock.increment(1_000_000u64);
+        s.sync();
+        assert_eq!(s.queue.recycle_floor(), 5);
+        go.send(()).unwrap();
+        producer.join().unwrap();
+        s.finish();
+    }
+
+    #[test]
+    fn an_idle_recorder_floors_at_the_present() {
+        let mut s = start(usize::MAX);
+        s.mock.increment(777u64);
+        s.sync();
+        assert_eq!(s.queue.recycle_floor(), 777);
+        s.finish();
     }
 
     #[test]

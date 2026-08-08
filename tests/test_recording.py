@@ -7,6 +7,7 @@ a file in the output directory. The run itself always ends with a dump,
 so a crash or a plain exit still leaves the recent past on disk.
 """
 
+import gc
 import subprocess
 import sys
 import time
@@ -205,6 +206,37 @@ def test_the_cli_records_when_asked(tmp_path: Path):
     files = dumps_named(out, "exit")
     assert len(files) == 1
     assert "cli_marker" in slice_names(load(files[0]))
+
+
+def fresh_marker():
+    pass
+
+
+def filler_step():
+    pass
+
+
+def churn(count: int):
+    for i in range(count):
+        space = {}
+        exec(f"def churned_{i}():\n    pass", space)
+        space[f"churned_{i}"]()
+
+
+def test_code_churn_beyond_the_id_space_keeps_tracing(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("TRACE0_CODE_CAPACITY", "256")
+    out = tmp_path / "dumps"
+    with Tracer(str(out), format="json", record_last_mb=1) as t:
+        filler_step()
+        churn(300)
+        gc.collect()
+        for _ in range(200_000):
+            filler_step()
+        t.dump("advance")
+        with t.snapshot("fresh"):
+            fresh_marker()
+    names = slice_names(load(dumps_named(out, "fresh")[0]))
+    assert "fresh_marker" in names
 
 
 def test_a_spawned_child_dumps_its_own_file(tmp_path: Path):

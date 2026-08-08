@@ -48,7 +48,7 @@ unsafe extern "C" fn on_code_event(event: c_int, code: *mut ffi::PyCodeObject) -
     let key = code as usize;
     let mut forgotten = false;
     for state in &states {
-        forgotten |= state.interner.forget(key);
+        forgotten |= state.interner.forget(key, state.queue.clock().raw());
     }
     if forgotten {
         GENERATION.fetch_add(1, Ordering::Release);
