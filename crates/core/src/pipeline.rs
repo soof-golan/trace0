@@ -9,10 +9,10 @@ use std::thread;
 use std::time::Duration;
 
 const FANIN_BATCHES: usize = 256;
-const IDLE_MIN: Duration = Duration::from_micros(20);
+pub(crate) const IDLE_MIN: Duration = Duration::from_micros(20);
 const IDLE_MAX: Duration = Duration::from_micros(200);
 
-fn backoff(idle: &mut Duration) {
+pub(crate) fn backoff(idle: &mut Duration) {
     thread::sleep(*idle);
     *idle = (*idle * 2).min(IDLE_MAX);
 }
