@@ -53,13 +53,36 @@ pub fn pack_code_kind(code_id: u32, kind: EventKind) -> u32 {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[repr(C)]
+#[repr(C, align(8))]
 pub struct PackedEvent {
     pub delta_ticks: u32,
     pub code_kind: u32,
 }
 
 const _: () = assert!(std::mem::size_of::<PackedEvent>() == 8);
+const _: () = assert!(std::mem::align_of::<PackedEvent>() == 8);
+
+impl PackedEvent {
+    #[inline]
+    pub fn to_bits(self) -> u64 {
+        unsafe { std::mem::transmute(self) }
+    }
+
+    #[inline]
+    pub fn from_bits(bits: u64) -> Self {
+        unsafe { std::mem::transmute(bits) }
+    }
+
+    #[inline]
+    pub fn code_id(self) -> u32 {
+        self.code_kind & CODE_ID_MASK
+    }
+
+    #[inline]
+    pub fn kind(self) -> EventKind {
+        EventKind::from_u8((self.code_kind >> 24) as u8)
+    }
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(C)]
@@ -169,6 +192,17 @@ mod tests {
         };
         let ev = Event::from_packed(&clock, 240, 1, p);
         assert_eq!(ev.ts_ns, 264);
+    }
+
+    #[test]
+    fn packed_event_bits_round_trip() {
+        let p = PackedEvent {
+            delta_ticks: 0xDEAD_BEEF,
+            code_kind: pack_code_kind(0x00AB_CDEF, EventKind::Yield),
+        };
+        assert_eq!(PackedEvent::from_bits(p.to_bits()), p);
+        assert_eq!(p.code_id(), 0x00AB_CDEF);
+        assert_eq!(p.kind(), EventKind::Yield);
     }
 
     #[test]

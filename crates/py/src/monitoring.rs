@@ -5,6 +5,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyAny;
 use std::ffi::CStr;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use trace0_core::clock::read_counter;
 use trace0_core::codecache::CodeCache;
 use trace0_core::event::{EventKind, os_tid};
@@ -48,7 +49,7 @@ fn resolve_cold(
     hot: &mut trace0_core::tls::Hot,
 ) -> Option<u32> {
     let generation = crate::codewatch::generation();
-    if hot.queue_id != state.run {
+    if hot.queue_id.load(Ordering::Relaxed) != state.run {
         *codes() = CodeCache::EMPTY;
         hot.last_code_key = trace0_core::tls::NOT_CACHED;
         hot.ensured = false;
@@ -58,12 +59,12 @@ fn resolve_cold(
         *codes() = CodeCache::EMPTY;
         hot.code_gen = generation;
     }
-    if hot.tid == u32::MAX {
-        hot.tid = os_tid();
+    if hot.tid.load(Ordering::Relaxed) == u32::MAX {
+        hot.tid.store(os_tid(), Ordering::Relaxed);
     }
     if !hot.ensured && hot.name_retries > 0 {
         hot.name_retries -= 1;
-        hot.ensured = state.threads.ensure(py, hot.tid);
+        hot.ensured = state.threads.ensure(py, hot.tid.load(Ordering::Relaxed));
     }
     let id = match codes().get(key) {
         Some(id) => id,
@@ -89,13 +90,13 @@ fn resolve_cold(
 fn record(py: Python<'_>, state: &State, code: pyo3::Borrowed<'_, '_, PyAny>, kind: EventKind) {
     let key = code.as_ptr() as usize;
     let hot = hot();
-    let ticks = if hot.clock_direct {
+    let ticks = if hot.clock_direct.load(Ordering::Relaxed) {
         read_counter()
     } else {
         state.queue.clock().raw()
     };
     let code_id = if hot.last_code_key == key
-        && hot.queue_id == state.run
+        && hot.queue_id.load(Ordering::Relaxed) == state.run
         && hot.code_gen == crate::codewatch::generation()
     {
         hot.last_code_id
@@ -105,9 +106,10 @@ fn record(py: Python<'_>, state: &State, code: pyo3::Borrowed<'_, '_, PyAny>, ki
             None => return,
         }
     };
+    let tid = hot.tid.load(Ordering::Relaxed);
     state
         .queue
-        .push_with_ctx(hot, state.run, ticks, hot.tid, code_id, kind);
+        .push_with_ctx(hot, state.run, ticks, tid, code_id, kind);
 }
 
 #[pyclass(module = "trace0._core", frozen)]

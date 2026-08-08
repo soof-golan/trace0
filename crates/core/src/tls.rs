@@ -3,20 +3,21 @@ use crate::event::PackedEvent;
 use crate::evqueue::{BATCH_N, EventBatch};
 use rtrb::{Producer, PushError};
 use std::cell::{RefCell, UnsafeCell};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering, fence};
 
 pub const NOT_CACHED: usize = usize::MAX;
 
-#[derive(Clone, Copy)]
 pub struct Hot {
-    pub cursor: *mut PackedEvent,
-    pub end: *mut PackedEvent,
-    pub base_ticks: u64,
-    pub queue_id: u64,
+    pub cursor: AtomicPtr<PackedEvent>,
+    pub end: AtomicPtr<PackedEvent>,
+    pub base_ticks: AtomicU64,
+    pub queue_id: AtomicU64,
+    pub epoch: AtomicU64,
     pub code_gen: u64,
-    pub clock_direct: bool,
+    pub clock_direct: AtomicBool,
     pub last_code_key: usize,
     pub last_code_id: u32,
-    pub tid: u32,
+    pub tid: AtomicU32,
     pub ensured: bool,
     pub name_retries: u32,
 }
@@ -24,19 +25,22 @@ pub struct Hot {
 const _: () = assert!(!std::mem::needs_drop::<Hot>());
 
 impl Hot {
-    pub const EMPTY: Self = Self {
-        cursor: std::ptr::null_mut(),
-        end: std::ptr::null_mut(),
-        base_ticks: 0,
-        queue_id: 0,
-        code_gen: 0,
-        clock_direct: false,
-        last_code_key: NOT_CACHED,
-        last_code_id: u32::MAX,
-        tid: u32::MAX,
-        ensured: false,
-        name_retries: 0,
-    };
+    pub const fn empty() -> Self {
+        Self {
+            cursor: AtomicPtr::new(std::ptr::null_mut()),
+            end: AtomicPtr::new(std::ptr::null_mut()),
+            base_ticks: AtomicU64::new(0),
+            queue_id: AtomicU64::new(0),
+            epoch: AtomicU64::new(0),
+            code_gen: 0,
+            clock_direct: AtomicBool::new(false),
+            last_code_key: NOT_CACHED,
+            last_code_id: u32::MAX,
+            tid: AtomicU32::new(u32::MAX),
+            ensured: false,
+            name_retries: 0,
+        }
+    }
 }
 
 pub struct Cold {
@@ -50,32 +54,43 @@ impl Cold {
             return;
         };
         let start = batch.events.as_mut_ptr();
+        let cursor = hot.cursor.load(Ordering::Relaxed);
+        let end = hot.end.load(Ordering::Relaxed);
         debug_assert!(
-            hot.end == unsafe { start.add(batch.events.capacity()) },
+            end == unsafe { start.add(batch.events.capacity()) },
             "commit: hot is armed for a different batch than this one"
         );
         debug_assert!(
-            hot.cursor >= start && hot.cursor <= hot.end,
+            cursor >= start && cursor <= end,
             "commit: cursor has left the batch it is measured against"
         );
-        let len = unsafe { hot.cursor.offset_from(start) } as usize;
+        let len = unsafe { cursor.offset_from(start) } as usize;
         unsafe { batch.events.set_len(len) };
     }
 
-    pub fn arm(&mut self, hot: &mut Hot) {
-        let Some(batch) = self.batch.as_mut() else {
-            hot.cursor = std::ptr::null_mut();
-            hot.end = std::ptr::null_mut();
-            return;
-        };
-        hot.base_ticks = batch.base_ticks;
-        let start = batch.events.as_mut_ptr();
-        hot.cursor = start;
-        hot.end = unsafe { start.add(BATCH_N) };
+    pub fn arm(&mut self, hot: &Hot) {
+        let epoch = hot.epoch.load(Ordering::Relaxed);
+        hot.epoch.store(epoch.wrapping_add(1), Ordering::Relaxed);
+        fence(Ordering::Release);
+        match self.batch.as_mut() {
+            None => {
+                hot.cursor.store(std::ptr::null_mut(), Ordering::Relaxed);
+                hot.end.store(std::ptr::null_mut(), Ordering::Relaxed);
+            }
+            Some(batch) => {
+                hot.base_ticks.store(batch.base_ticks, Ordering::Relaxed);
+                hot.tid.store(batch.tid, Ordering::Relaxed);
+                let start = batch.events.as_mut_ptr();
+                hot.cursor.store(start, Ordering::Relaxed);
+                hot.end
+                    .store(unsafe { start.add(BATCH_N) }, Ordering::Relaxed);
+            }
+        }
+        hot.epoch.store(epoch.wrapping_add(2), Ordering::Release);
     }
 
     #[must_use]
-    pub fn flush_partial(&mut self, hot: &mut Hot) -> u64 {
+    pub fn flush_partial(&mut self, hot: &Hot) -> u64 {
         self.commit(hot);
         let Some(batch) = self.batch.take() else {
             return 0;
@@ -133,17 +148,67 @@ pub fn forget_other_threads() {
     RECORDERS.lock().retain(|r| r.cold == cold);
 }
 
+const TAIL_RETRIES: usize = 8;
+
+pub fn read_tails(queue_id: u64) -> Vec<EventBatch> {
+    let recorders = RECORDERS.lock();
+    recorders
+        .iter()
+        .filter_map(|r| unsafe { read_tail(&*r.hot, queue_id) })
+        .collect()
+}
+
+unsafe fn read_tail(hot: &Hot, queue_id: u64) -> Option<EventBatch> {
+    for _ in 0..TAIL_RETRIES {
+        let epoch = hot.epoch.load(Ordering::Acquire);
+        if epoch & 1 == 1 {
+            std::hint::spin_loop();
+            continue;
+        }
+        if hot.queue_id.load(Ordering::Relaxed) != queue_id {
+            return None;
+        }
+        let cursor = hot.cursor.load(Ordering::Acquire);
+        let end = hot.end.load(Ordering::Relaxed);
+        if cursor.is_null() || end.is_null() {
+            return None;
+        }
+        let start = unsafe { end.sub(BATCH_N) };
+        let len = unsafe { cursor.offset_from(start) };
+        if len <= 0 || len as usize > BATCH_N {
+            continue;
+        }
+        let base_ticks = hot.base_ticks.load(Ordering::Relaxed);
+        let tid = hot.tid.load(Ordering::Relaxed);
+        let mut events = Vec::with_capacity(len as usize);
+        for i in 0..len as usize {
+            let slot = unsafe { &*start.add(i).cast::<std::sync::atomic::AtomicU64>() };
+            events.push(PackedEvent::from_bits(slot.load(Ordering::Relaxed)));
+        }
+        fence(Ordering::Acquire);
+        if hot.epoch.load(Ordering::Relaxed) != epoch {
+            continue;
+        }
+        return Some(EventBatch {
+            base_ticks,
+            tid,
+            events,
+        });
+    }
+    None
+}
+
 pub fn flush_every_thread() -> u64 {
     let recorders = RECORDERS.lock();
     let mut lost = 0;
     for r in recorders.iter() {
-        lost += unsafe { (*r.cold).flush_partial(&mut *r.hot) };
+        lost += unsafe { (*r.cold).flush_partial(&*r.hot) };
     }
     lost
 }
 
 thread_local! {
-    static HOT: UnsafeCell<Hot> = const { UnsafeCell::new(Hot::EMPTY) };
+    static HOT: UnsafeCell<Hot> = const { UnsafeCell::new(Hot::empty()) };
     static CODES: UnsafeCell<CodeCache> = const { UnsafeCell::new(CodeCache::EMPTY) };
     pub static COLD: RefCell<Cold> = const {
         RefCell::new(Cold {
@@ -187,29 +252,36 @@ mod tests {
         cold
     }
 
-    fn walk(hot: &mut Hot, n: usize) {
+    fn walk(hot: &Hot, n: usize) {
         for i in 0..n {
+            let cursor = hot.cursor.load(Ordering::Relaxed);
             unsafe {
-                hot.cursor.write(PackedEvent {
-                    delta_ticks: i as u32,
-                    code_kind: 0,
-                });
-                hot.cursor = hot.cursor.add(1);
+                (*cursor.cast::<AtomicU64>()).store(
+                    PackedEvent {
+                        delta_ticks: i as u32,
+                        code_kind: 0,
+                    }
+                    .to_bits(),
+                    Ordering::Relaxed,
+                );
             }
+            hot.cursor
+                .store(unsafe { cursor.add(1) }, Ordering::Release);
         }
     }
 
     #[test]
     fn an_untouched_thread_holds_no_recording_state() {
-        let h = Hot::EMPTY;
-        assert!(h.cursor.is_null());
+        let h = Hot::empty();
+        let cursor = h.cursor.load(Ordering::Relaxed);
+        assert!(cursor.is_null());
         assert!(
-            h.cursor >= h.end,
+            cursor >= h.end.load(Ordering::Relaxed),
             "the empty cursor must fail the push guard"
         );
         assert_eq!(h.last_code_key, NOT_CACHED);
-        assert_eq!(h.tid, u32::MAX);
-        assert_eq!(h.queue_id, 0);
+        assert_eq!(h.tid.load(Ordering::Relaxed), u32::MAX);
+        assert_eq!(h.queue_id.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -223,9 +295,10 @@ mod tests {
                 0,
                 "a thread with no producer has nowhere to lose events"
             );
-            assert!(!hot.cursor.is_null());
+            let cursor = hot.cursor.load(Ordering::Relaxed);
+            assert!(!cursor.is_null());
             assert!(
-                hot.cursor < hot.end,
+                cursor < hot.end.load(Ordering::Relaxed),
                 "a straggler event would write through a dead cursor"
             );
         });
@@ -250,7 +323,10 @@ mod tests {
             let hot = hot();
             let mut cold = armed(hot);
             walk(hot, BATCH_N);
-            assert_eq!(hot.cursor, hot.end);
+            assert_eq!(
+                hot.cursor.load(Ordering::Relaxed),
+                hot.end.load(Ordering::Relaxed)
+            );
             cold.commit(hot);
             cold.batch.as_ref().unwrap().events.len()
         });
@@ -265,7 +341,10 @@ mod tests {
             let hot = hot();
             let mut cold = std::mem::ManuallyDrop::new(armed(hot));
             walk(hot, BATCH_N);
-            hot.cursor = hot.cursor.wrapping_add(1);
+            hot.cursor.store(
+                hot.cursor.load(Ordering::Relaxed).wrapping_add(1),
+                Ordering::Relaxed,
+            );
             cold.commit(hot);
         });
     }

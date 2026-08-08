@@ -10,6 +10,11 @@ pub const BATCHES_CAPACITY: usize = 64;
 
 const DELTA_OVERFLOW: u64 = u32::MAX as u64;
 
+#[inline]
+fn write_slot(cursor: *mut PackedEvent, event: PackedEvent) {
+    unsafe { (*cursor.cast::<AtomicU64>()).store(event.to_bits(), Ordering::Relaxed) }
+}
+
 pub struct EventBatch {
     pub base_ticks: u64,
     pub tid: u32,
@@ -91,7 +96,7 @@ impl EventQueue {
     #[inline]
     pub fn push_with_ctx(
         &self,
-        hot: &mut Hot,
+        hot: &Hot,
         run: u64,
         ticks: u64,
         tid: u32,
@@ -99,15 +104,21 @@ impl EventQueue {
         kind: EventKind,
     ) {
         let code_kind = pack_code_kind(code_id, kind);
-        let delta = ticks.wrapping_sub(hot.base_ticks);
-        if hot.cursor < hot.end && hot.queue_id == run && delta <= DELTA_OVERFLOW {
-            unsafe {
-                hot.cursor.write(PackedEvent {
+        let delta = ticks.wrapping_sub(hot.base_ticks.load(Ordering::Relaxed));
+        let cursor = hot.cursor.load(Ordering::Relaxed);
+        if cursor < hot.end.load(Ordering::Relaxed)
+            && hot.queue_id.load(Ordering::Relaxed) == run
+            && delta <= DELTA_OVERFLOW
+        {
+            write_slot(
+                cursor,
+                PackedEvent {
                     delta_ticks: delta as u32,
                     code_kind,
-                });
-                hot.cursor = hot.cursor.add(1);
-            }
+                },
+            );
+            hot.cursor
+                .store(unsafe { cursor.add(1) }, Ordering::Release);
             return;
         }
         self.slow_path(hot, ticks, tid, code_kind);
@@ -115,20 +126,21 @@ impl EventQueue {
 
     #[cold]
     #[inline(never)]
-    fn init_producer(&self, cold: &mut Cold, hot: &mut Hot, ticks: u64, tid: u32) {
+    fn init_producer(&self, cold: &mut Cold, hot: &Hot, ticks: u64, tid: u32) {
         let (prod, cons) = RingBuffer::<Box<EventBatch>>::new(BATCHES_CAPACITY);
         self.shared.consumers.lock().push(cons);
         cold.producer = Some((self.id, prod));
         cold.batch = Some(Box::new(EventBatch::with_capacity(BATCH_N, ticks, tid)));
         crate::tls::register_current();
-        hot.queue_id = self.id;
-        hot.clock_direct = self.clock.is_direct();
+        hot.queue_id.store(self.id, Ordering::Relaxed);
+        hot.clock_direct
+            .store(self.clock.is_direct(), Ordering::Relaxed);
         cold.arm(hot);
     }
 
     #[cold]
     #[inline(never)]
-    fn slow_path(&self, hot: &mut Hot, ticks: u64, tid: u32, code_kind: u32) {
+    fn slow_path(&self, hot: &Hot, ticks: u64, tid: u32, code_kind: u32) {
         COLD.with(|cold| {
             let cold = &mut *cold.borrow_mut();
             let stale = match &cold.producer {
@@ -141,17 +153,20 @@ impl EventQueue {
                 self.ship_and_renew(cold, hot, ticks, tid);
             }
         });
-        unsafe {
-            hot.cursor.write(PackedEvent {
+        let cursor = hot.cursor.load(Ordering::Relaxed);
+        write_slot(
+            cursor,
+            PackedEvent {
                 delta_ticks: 0,
                 code_kind,
-            });
-            hot.cursor = hot.cursor.add(1);
-        }
+            },
+        );
+        hot.cursor
+            .store(unsafe { cursor.add(1) }, Ordering::Release);
     }
 
     #[inline]
-    fn ship_and_renew(&self, cold: &mut Cold, hot: &mut Hot, base_ticks: u64, tid: u32) {
+    fn ship_and_renew(&self, cold: &mut Cold, hot: &Hot, base_ticks: u64, tid: u32) {
         cold.commit(hot);
         let full = cold.batch.take().unwrap();
         let (_, prod) = cold.producer.as_mut().unwrap();
@@ -196,6 +211,10 @@ impl EventQueue {
 
     pub fn is_closed(&self) -> bool {
         self.shared.closed.load(Ordering::Acquire)
+    }
+
+    pub fn read_tails(&self) -> Vec<EventBatch> {
+        crate::tls::read_tails(self.id)
     }
 
     pub fn dropped(&self) -> u64 {
@@ -301,7 +320,7 @@ mod tests {
 
     #[test]
     fn no_queue_takes_the_id_a_fresh_thread_starts_with() {
-        assert_eq!(Hot::EMPTY.queue_id, 0);
+        assert_eq!(Hot::empty().queue_id.load(Ordering::Relaxed), 0);
         for _ in 0..8 {
             assert_ne!(EventQueue::new(test_clock()).id(), 0);
         }
@@ -444,5 +463,125 @@ mod tests {
                 .collect(),
         );
         assert_eq!(out.len(), BATCH_N * 4);
+    }
+
+    fn hold_after<T: Send + 'static>(
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> (
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<T>,
+        std::sync::mpsc::Receiver<()>,
+    ) {
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let out = work();
+            done_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+            out
+        });
+        (go_tx, handle, done_rx)
+    }
+
+    #[test]
+    fn the_tail_of_a_live_thread_is_readable() {
+        let q = std::sync::Arc::new(EventQueue::new(test_clock()));
+        let (go, producer, ready) = {
+            let q = q.clone();
+            hold_after(move || {
+                let hot = hot();
+                for i in 0..5u64 {
+                    q.push_with_ctx(hot, q.id(), 10 + i, 3, 7, EventKind::Begin);
+                }
+            })
+        };
+        ready.recv().unwrap();
+        let tails = q.read_tails();
+        assert_eq!(tails.len(), 1);
+        assert_eq!(tails[0].tid, 3);
+        assert_eq!(tails[0].base_ticks, 10);
+        let deltas: Vec<u32> = tails[0].events.iter().map(|e| e.delta_ticks).collect();
+        assert_eq!(deltas, [0, 1, 2, 3, 4]);
+        go.send(()).unwrap();
+        producer.join().unwrap();
+    }
+
+    #[test]
+    fn a_flushed_tail_is_no_longer_readable() {
+        let q = std::sync::Arc::new(EventQueue::new(test_clock()));
+        let (go, producer, ready) = {
+            let q = q.clone();
+            hold_after(move || {
+                let hot = hot();
+                for i in 0..5u64 {
+                    q.push_with_ctx(hot, q.id(), i, 3, 7, EventKind::Begin);
+                }
+                COLD.with_borrow_mut(|cold| cold.flush_partial(hot));
+            })
+        };
+        ready.recv().unwrap();
+        assert!(q.read_tails().is_empty());
+        go.send(()).unwrap();
+        producer.join().unwrap();
+    }
+
+    #[test]
+    fn tails_of_another_queue_are_invisible() {
+        let q = std::sync::Arc::new(EventQueue::new(test_clock()));
+        let other = EventQueue::new(test_clock());
+        let (go, producer, ready) = {
+            let q = q.clone();
+            hold_after(move || {
+                let hot = hot();
+                q.push_with_ctx(hot, q.id(), 0, 3, 7, EventKind::Begin);
+            })
+        };
+        ready.recv().unwrap();
+        assert!(other.read_tails().is_empty());
+        assert_eq!(q.read_tails().len(), 1);
+        go.send(()).unwrap();
+        producer.join().unwrap();
+    }
+
+    #[test]
+    fn a_concurrent_tail_reader_never_sees_a_torn_event() {
+        use crate::event::CODE_ID_MASK;
+        let q = std::sync::Arc::new(EventQueue::new(test_clock()));
+        let n: u64 = 2_000_000;
+        let producer = {
+            let q = q.clone();
+            std::thread::spawn(move || {
+                let hot = hot();
+                for i in 0..n {
+                    q.push_with_ctx(
+                        hot,
+                        q.id(),
+                        i,
+                        9,
+                        (i as u32) & CODE_ID_MASK,
+                        EventKind::Begin,
+                    );
+                }
+            })
+        };
+        while !producer.is_finished() {
+            for tail in q.read_tails() {
+                let mut prev = None;
+                for ev in &tail.events {
+                    let seq = tail.base_ticks + ev.delta_ticks as u64;
+                    assert_eq!(
+                        ev.code_id(),
+                        (seq as u32) & CODE_ID_MASK,
+                        "a torn event mixed two writes"
+                    );
+                    assert_eq!(ev.kind(), EventKind::Begin);
+                    if let Some(prev) = prev {
+                        assert_eq!(seq, prev + 1, "one tail mixed two batch generations");
+                    }
+                    prev = Some(seq);
+                }
+            }
+        }
+        producer.join().unwrap();
     }
 }
