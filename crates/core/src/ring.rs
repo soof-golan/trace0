@@ -52,6 +52,10 @@ impl Ring {
         }
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = &EventBatch> {
+        self.batches.iter().map(|b| b.as_ref())
+    }
+
     pub fn bytes(&self) -> usize {
         self.bytes
     }
@@ -112,6 +116,16 @@ mod tests {
         ring.pop().unwrap();
         assert_eq!(ring.bytes(), 0);
         assert!(ring.is_empty());
+    }
+
+    #[test]
+    fn iteration_walks_oldest_to_newest_without_consuming() {
+        let mut ring = Ring::new(usize::MAX);
+        ring.push(batch(0, 1, 4));
+        ring.push(batch(100, 2, 4));
+        let tids: Vec<u32> = ring.iter().map(|b| b.tid).collect();
+        assert_eq!(tids, [1, 2]);
+        assert_eq!(ring.len(), 2);
     }
 
     #[test]

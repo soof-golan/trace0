@@ -6,6 +6,7 @@ pub mod output;
 pub mod pipeline;
 pub mod ring;
 pub mod sink;
+pub mod snapshot;
 pub mod tls;
 
 pub use clock::Clock;
