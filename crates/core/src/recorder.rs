@@ -23,10 +23,12 @@ pub enum Control {
         start_ticks: u64,
         end_ticks: u64,
         reason: String,
+        done: Option<std::sync::mpsc::Sender<()>>,
     },
     DumpAll {
         end_ticks: u64,
         reason: String,
+        done: Option<std::sync::mpsc::Sender<()>>,
     },
 }
 
@@ -120,13 +122,24 @@ impl Recorder {
                 start_ticks,
                 end_ticks,
                 reason,
+                done,
             } => {
                 self.dump(codes, threads, sinks, start_ticks, end_ticks, &reason)?;
                 self.windows.retain(|(window, _)| *window != id);
                 self.refloor();
+                if let Some(done) = done {
+                    done.send(()).ok();
+                }
             }
-            Control::DumpAll { end_ticks, reason } => {
+            Control::DumpAll {
+                end_ticks,
+                reason,
+                done,
+            } => {
                 self.dump(codes, threads, sinks, 0, end_ticks, &reason)?;
+                if let Some(done) = done {
+                    done.send(()).ok();
+                }
             }
         }
         Ok(())
@@ -289,6 +302,7 @@ mod tests {
                 .send(Control::DumpAll {
                     end_ticks: 0,
                     reason: reason.clone(),
+                    done: None,
                 })
                 .unwrap();
             self.wait_for(&reason);
@@ -353,6 +367,7 @@ mod tests {
                 start_ticks: 10,
                 end_ticks: 25,
                 reason: "slice".into(),
+                done: None,
             })
             .unwrap();
         let dumps = s.finish();
@@ -379,6 +394,7 @@ mod tests {
                 start_ticks: 1,
                 end_ticks: 10,
                 reason: "tail".into(),
+                done: None,
             })
             .unwrap();
         s.wait_for("tail");
@@ -407,6 +423,7 @@ mod tests {
                 start_ticks: 1,
                 end_ticks: u64::MAX,
                 reason: "kept".into(),
+                done: None,
             })
             .unwrap();
         let dumps = s.finish();
@@ -423,6 +440,7 @@ mod tests {
             .send(Control::DumpAll {
                 end_ticks: u64::MAX,
                 reason: "rest".into(),
+                done: None,
             })
             .unwrap();
         let dumps = s.finish();
@@ -448,6 +466,7 @@ mod tests {
             .send(Control::DumpAll {
                 end_ticks: u64::MAX,
                 reason: "after-cancel".into(),
+                done: None,
             })
             .unwrap();
         let dumps = s.finish();
@@ -483,6 +502,7 @@ mod tests {
                 start_ticks: 3_000,
                 end_ticks: u64::MAX,
                 reason: "second".into(),
+                done: None,
             })
             .unwrap();
         let dumps = s.finish();
@@ -507,6 +527,7 @@ mod tests {
             .send(Control::DumpAll {
                 end_ticks: u64::MAX,
                 reason: "big".into(),
+                done: None,
             })
             .unwrap();
         let dumps = s.finish();
@@ -519,6 +540,23 @@ mod tests {
     }
 
     #[test]
+    fn a_dump_acknowledges_only_after_it_is_written() {
+        let s = start(usize::MAX);
+        s.produce(1, vec![(1, EventKind::Begin), (2, EventKind::End)]);
+        let (done, written) = mpsc::channel();
+        s.control
+            .send(Control::DumpAll {
+                end_ticks: 10,
+                reason: "acked".into(),
+                done: Some(done),
+            })
+            .unwrap();
+        written.recv().unwrap();
+        assert!(s.dumps.lock().iter().any(|(reason, _)| reason == "acked"));
+        s.finish();
+    }
+
+    #[test]
     fn a_dump_sent_with_close_still_lands() {
         let s = start(usize::MAX);
         s.produce(1, vec![(1, EventKind::Begin), (2, EventKind::End)]);
@@ -526,6 +564,7 @@ mod tests {
             .send(Control::DumpAll {
                 end_ticks: 10,
                 reason: "exit".into(),
+                done: None,
             })
             .unwrap();
         let dumps = s.finish();

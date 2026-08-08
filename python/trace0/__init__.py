@@ -10,6 +10,7 @@ __all__ = ["Tracer", "TraceFormat", "process_startup"]
 
 CHILD_OUTPUT = "TRACE0_CHILD_OUTPUT"
 CHILD_FORMAT = "TRACE0_CHILD_FORMAT"
+CHILD_RECORD_MB = "TRACE0_CHILD_RECORD_MB"
 
 _started: Optional[Tracer] = None
 
@@ -34,7 +35,12 @@ def process_startup() -> Optional[Tracer]:
     if not output:
         return None
 
-    tracer = Tracer(output, format=os.environ.get(CHILD_FORMAT, "protobuf"))
+    record = os.environ.get(CHILD_RECORD_MB)
+    tracer = Tracer(
+        output,
+        format=os.environ.get(CHILD_FORMAT, "protobuf"),
+        record_last_mb=int(record) if record else None,
+    )
     tracer._enter_as_child()
     atexit.register(tracer.__exit__, None, None, None)
     _started = tracer

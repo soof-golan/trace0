@@ -39,6 +39,10 @@ struct RunArgs {
         conflicts_with = "script"
     )]
     module: Vec<String>,
+    /// Keep the last N megabytes of events in memory and write only dumps.
+    /// The output becomes a directory of dump files.
+    #[arg(long, value_name = "MB")]
+    record_last_mb: Option<usize>,
     /// Trace only this process, leaving the ones it starts alone.
     #[arg(long)]
     no_trace_subprocesses: bool,
@@ -94,13 +98,19 @@ fn run(py: Python<'_>, a: RunArgs) -> PyResult<i32> {
         output,
         format,
         module,
+        record_last_mb,
         no_trace_subprocesses,
         script,
         script_args,
     } = a;
     let tracer = Py::new(
         py,
-        Tracer::new(output, format.as_str().to_string(), !no_trace_subprocesses)?,
+        Tracer::new(
+            output,
+            format.as_str().to_string(),
+            !no_trace_subprocesses,
+            record_last_mb,
+        )?,
     )?;
     let (target, args, argv0) = split_target(module, script, script_args);
 

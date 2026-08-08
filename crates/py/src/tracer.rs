@@ -1,20 +1,26 @@
 use crate::format::Format;
 use crate::intern::Interner;
 use crate::monitoring::{self, MonitoringHandle, State};
+use crate::recording::{DirSink, next_window, parse_duration_ns};
 use crate::threads::ThreadRegistry;
 use parking_lot::Mutex;
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyType;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::thread;
-use trace0_core::{Clock, CodeLookup, EventQueue, ThreadNames, run_pipeline, tls};
+use trace0_core::{
+    Clock, CodeLookup, Control, EventQueue, ThreadNames, run_pipeline, run_recorder, tls,
+};
 
 pub(crate) struct Running {
-    queue: Arc<EventQueue>,
+    pub(crate) queue: Arc<EventQueue>,
     state: Arc<State>,
     monitoring: Option<MonitoringHandle>,
     exporter: thread::JoinHandle<std::io::Result<()>>,
+    pub(crate) control: Option<mpsc::Sender<Control>>,
 }
 
 static ACTIVE: Mutex<Option<Py<Tracer>>> = Mutex::new(None);
@@ -28,6 +34,7 @@ pub struct Tracer {
     output: String,
     format: Format,
     trace_subprocesses: bool,
+    record_last_mb: Option<usize>,
     running: Mutex<Option<Running>>,
 }
 
@@ -50,19 +57,36 @@ impl Tracer {
         });
         crate::codewatch::watch(py, &state)?;
 
-        let sink = self
-            .format
-            .open(&self.output, slot, append)
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
-
-        let exporter = {
-            let queue = queue.clone();
-            let codes: Arc<dyn CodeLookup> = state.clone();
-            let names: Arc<dyn ThreadNames> = state.clone();
-            thread::Builder::new()
-                .name("trace0-exporter".into())
-                .spawn(move || run_pipeline(queue, codes, names, sink))
-                .map_err(|e| PyRuntimeError::new_err(format!("spawn exporter: {e}")))?
+        let codes: Arc<dyn CodeLookup> = state.clone();
+        let names: Arc<dyn ThreadNames> = state.clone();
+        let spawn = thread::Builder::new().name("trace0-exporter".into());
+        let (control, exporter) = match self.record_last_mb {
+            None => {
+                let sink = self
+                    .format
+                    .open(&self.output, slot, append)
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
+                let queue = queue.clone();
+                let exporter = spawn
+                    .spawn(move || run_pipeline(queue, codes, names, sink))
+                    .map_err(|e| PyRuntimeError::new_err(format!("spawn exporter: {e}")))?;
+                (None, exporter)
+            }
+            Some(mb) => {
+                std::fs::create_dir_all(&self.output)
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
+                let sink = Box::new(DirSink {
+                    dir: PathBuf::from(&self.output),
+                    format: self.format,
+                    pid: slot,
+                });
+                let (tx, rx) = mpsc::channel();
+                let queue = queue.clone();
+                let exporter = spawn
+                    .spawn(move || run_recorder(queue, codes, names, sink, mb << 20, rx))
+                    .map_err(|e| PyRuntimeError::new_err(format!("spawn exporter: {e}")))?;
+                (Some(tx), exporter)
+            }
         };
 
         match monitoring::enable(py, state.clone()) {
@@ -71,6 +95,7 @@ impl Tracer {
                 state,
                 monitoring: Some(monitoring),
                 exporter,
+                control,
             }),
             Err(e) => {
                 queue.close();
@@ -80,12 +105,13 @@ impl Tracer {
         }
     }
 
-    pub(crate) fn end(py: Python<'_>, running: Running) -> PyResult<()> {
+    pub(crate) fn end(py: Python<'_>, running: Running, reason: &str) -> PyResult<()> {
         let Running {
             queue,
             state: _,
             monitoring,
             exporter,
+            control,
         } = running;
 
         let disabled = match &monitoring {
@@ -93,6 +119,15 @@ impl Tracer {
             None => Ok(()),
         };
         queue.record_dropped(tls::flush_every_thread());
+        if let Some(control) = &control {
+            control
+                .send(Control::DumpAll {
+                    end_ticks: queue.clock().raw(),
+                    reason: reason.to_string(),
+                    done: None,
+                })
+                .ok();
+        }
         queue.close();
         let joined = py.detach(move || exporter.join());
 
@@ -103,21 +138,54 @@ impl Tracer {
             Err(_) => Err(PyRuntimeError::new_err("exporter thread panicked")),
         }
     }
+
+    pub(crate) fn with_recorder<T>(
+        &self,
+        f: impl FnOnce(&Running, &mpsc::Sender<Control>) -> PyResult<T>,
+    ) -> PyResult<T> {
+        let guard = self.running.lock();
+        let running = guard
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("the tracer is not running"))?;
+        let control = running.control.as_ref().ok_or_else(|| {
+            PyRuntimeError::new_err(
+                "this tracer streams as it goes; pass record_last_mb to keep a flight recorder",
+            )
+        })?;
+        f(running, control)
+    }
+}
+
+fn await_dump(py: Python<'_>, written: mpsc::Receiver<()>) -> PyResult<()> {
+    py.detach(move || written.recv())
+        .map_err(|_| PyRuntimeError::new_err("the recorder did not finish the dump"))
 }
 
 const CHILD_OUTPUT: &str = "TRACE0_CHILD_OUTPUT";
 const CHILD_FORMAT: &str = "TRACE0_CHILD_FORMAT";
+const CHILD_RECORD_MB: &str = "TRACE0_CHILD_RECORD_MB";
 
-fn advertise_to_spawned_children(py: Python<'_>, output: &str, format: Format) -> PyResult<()> {
+fn advertise_to_spawned_children(
+    py: Python<'_>,
+    output: &str,
+    format: Format,
+    record_last_mb: Option<usize>,
+) -> PyResult<()> {
     let environ = py.import("os")?.getattr("environ")?;
     environ.set_item(CHILD_OUTPUT, output)?;
     environ.set_item(CHILD_FORMAT, format.as_str())?;
+    match record_last_mb {
+        Some(mb) => environ.set_item(CHILD_RECORD_MB, mb.to_string())?,
+        None => {
+            environ.call_method1("pop", (CHILD_RECORD_MB, py.None()))?;
+        }
+    }
     Ok(())
 }
 
 fn stop_advertising(py: Python<'_>) -> PyResult<()> {
     let environ = py.import("os")?.getattr("environ")?;
-    for key in [CHILD_OUTPUT, CHILD_FORMAT] {
+    for key in [CHILD_OUTPUT, CHILD_FORMAT, CHILD_RECORD_MB] {
         environ.call_method1("pop", (key, py.None()))?;
     }
     Ok(())
@@ -176,7 +244,7 @@ fn end_active_run(py: Python<'_>) -> PyResult<()> {
         return Ok(());
     };
     match slot.take() {
-        Some(running) => Tracer::end(py, running),
+        Some(running) => Tracer::end(py, running, "signal"),
         None => Ok(()),
     }
 }
@@ -291,12 +359,18 @@ fn register_fork_hooks(py: Python<'_>) -> PyResult<()> {
 #[pymethods]
 impl Tracer {
     #[new]
-    #[pyo3(signature = (output, format = "protobuf".to_string(), trace_subprocesses = true))]
-    pub(crate) fn new(output: String, format: String, trace_subprocesses: bool) -> PyResult<Self> {
+    #[pyo3(signature = (output, format = "protobuf".to_string(), trace_subprocesses = true, record_last_mb = None))]
+    pub(crate) fn new(
+        output: String,
+        format: String,
+        trace_subprocesses: bool,
+        record_last_mb: Option<usize>,
+    ) -> PyResult<Self> {
         Ok(Self {
             output,
             format: Format::parse(&format).map_err(PyValueError::new_err)?,
             trace_subprocesses,
+            record_last_mb,
             running: Mutex::new(None),
         })
     }
@@ -307,7 +381,7 @@ impl Tracer {
     ) -> PyResult<Bound<'py, Self>> {
         let me = slf.get();
         match me.trace_subprocesses {
-            true => advertise_to_spawned_children(py, &me.output, me.format)?,
+            true => advertise_to_spawned_children(py, &me.output, me.format, me.record_last_mb)?,
             false => stop_advertising(py)?,
         }
         Self::install(slf, py, me.begin(py)?)
@@ -321,16 +395,80 @@ impl Tracer {
     pub(crate) fn __exit__(
         &self,
         py: Python<'_>,
-        _exc_type: Option<Bound<'_, PyType>>,
+        exc_type: Option<Bound<'_, PyType>>,
         _exc_val: Option<Bound<'_, pyo3::types::PyAny>>,
         _exc_tb: Option<Bound<'_, pyo3::types::PyAny>>,
     ) -> PyResult<bool> {
         *ACTIVE.lock() = None;
         hand_back_deadly_signals(py)?;
         stop_advertising(py)?;
+        let reason = match &exc_type {
+            Some(t) => format!("exception-{}", t.getattr("__name__")?.extract::<String>()?),
+            None => "exit".to_string(),
+        };
         if let Some(running) = self.running.lock().take() {
-            Tracer::end(py, running)?;
+            Tracer::end(py, running, &reason)?;
         }
         Ok(false)
+    }
+
+    #[pyo3(signature = (reason, slower_than = None, start = None, end = None))]
+    fn snapshot(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        reason: String,
+        slower_than: Option<String>,
+        start: Option<u64>,
+        end: Option<u64>,
+    ) -> PyResult<Py<PyAny>> {
+        let me = slf.get();
+        let slower_than_ns = match slower_than {
+            Some(text) => Some(parse_duration_ns(&text).map_err(PyValueError::new_err)?),
+            None => None,
+        };
+        match (start, end) {
+            (None, None) => {
+                me.with_recorder(|_, _| Ok(()))?;
+                let snapshot = crate::recording::Snapshot {
+                    tracer: slf.clone().unbind(),
+                    reason,
+                    slower_than_ns,
+                    window: Mutex::new(None),
+                };
+                Ok(Py::new(py, snapshot)?.into_any())
+            }
+            (Some(start_ns), Some(end_ns)) => {
+                let (done, written) = mpsc::channel();
+                me.with_recorder(|running, control| {
+                    let clock = running.queue.clock();
+                    control
+                        .send(Control::Dump {
+                            id: next_window(),
+                            start_ticks: clock.ticks_from_ns(start_ns),
+                            end_ticks: clock.ticks_from_ns(end_ns),
+                            reason,
+                            done: Some(done),
+                        })
+                        .map_err(|_| PyRuntimeError::new_err("the recorder is gone"))
+                })?;
+                await_dump(py, written)?;
+                Ok(py.None())
+            }
+            _ => Err(PyValueError::new_err("start and end come together")),
+        }
+    }
+
+    fn dump(&self, py: Python<'_>, reason: String) -> PyResult<()> {
+        let (done, written) = mpsc::channel();
+        self.with_recorder(|running, control| {
+            control
+                .send(Control::DumpAll {
+                    end_ticks: running.queue.clock().raw(),
+                    reason,
+                    done: Some(done),
+                })
+                .map_err(|_| PyRuntimeError::new_err("the recorder is gone"))
+        })?;
+        await_dump(py, written)
     }
 }
