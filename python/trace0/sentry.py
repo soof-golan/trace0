@@ -5,12 +5,13 @@ Usage::
     tracer = Tracer("dumps/", record_last_mb=64).__enter__()
     sentry_sdk.init(..., integrations=[Trace0Integration(tracer)])
 
-Each transaction that Sentry samples for profiling (per
-``profiles_sample_rate``) gets a dump of its own time window, and the
-event carries the dump path under ``contexts.trace0.dump``.
+Each transaction that Sentry itself sampled for profiling (per
+``profiles_sample_rate`` or ``profiles_sampler``) gets a dump of its own
+time window, and the event carries the dump path under
+``contexts.trace0.dump``. The integration reads Sentry's per-transaction
+decision; it never rolls its own.
 """
 
-import random
 import time
 
 import sentry_sdk
@@ -18,6 +19,18 @@ from sentry_sdk.integrations import Integration
 from sentry_sdk.scope import add_global_event_processor
 
 from trace0 import Tracer
+
+
+def profiled(event) -> bool:
+    profile = event.get("profile")
+    if profile is not None:
+        return bool(profile.sampled)
+    transaction = sentry_sdk.get_current_scope().transaction
+    if transaction is None or transaction._profile is None:
+        return False
+    if transaction.span_id != event["contexts"]["trace"]["span_id"]:
+        return False
+    return bool(transaction._profile.sampled)
 
 
 class Trace0Integration(Integration):
@@ -36,8 +49,7 @@ class Trace0Integration(Integration):
             integration = client.get_integration(Trace0Integration)
             if integration is None:
                 return event
-            rate = client.options.get("profiles_sample_rate")
-            if not rate or random.random() >= rate:
+            if not profiled(event):
                 return event
             tracer = integration.tracer
             name = event.get("transaction") or "transaction"

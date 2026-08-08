@@ -80,6 +80,45 @@ def test_a_zero_profiles_rate_keeps_the_transaction_but_skips_the_dump(tmp_path:
     assert "trace0" not in events[0].get("contexts", {})
 
 
+def test_a_profiles_sampler_grant_dumps_the_snapshot(tmp_path: Path):
+    out = tmp_path / "dumps"
+    transport = RecordingTransport()
+    with Tracer(str(out), format="json", record_last_mb=64) as t:
+        init_sentry(
+            t,
+            transport,
+            traces_sample_rate=1.0,
+            profiles_sampler=lambda context: 1.0,
+        )
+        with sentry_sdk.start_transaction(name="checkout"):
+            checkout_marker()
+        sentry_sdk.flush()
+        assert len(sentry_dumps(out)) == 1
+    events = transaction_events(transport)
+    assert len(events) == 1
+    assert "trace0" in events[0]["contexts"]
+
+
+def test_a_profiles_sampler_veto_skips_the_dump(tmp_path: Path):
+    out = tmp_path / "dumps"
+    transport = RecordingTransport()
+    with Tracer(str(out), format="json", record_last_mb=64) as t:
+        init_sentry(
+            t,
+            transport,
+            traces_sample_rate=1.0,
+            profiles_sample_rate=1.0,
+            profiles_sampler=lambda context: 0.0,
+        )
+        with sentry_sdk.start_transaction(name="checkout"):
+            checkout_marker()
+        sentry_sdk.flush()
+        assert sentry_dumps(out) == []
+    events = transaction_events(transport)
+    assert len(events) == 1
+    assert "trace0" not in events[0].get("contexts", {})
+
+
 def test_an_unsampled_transaction_dumps_nothing(tmp_path: Path):
     out = tmp_path / "dumps"
     transport = RecordingTransport()
