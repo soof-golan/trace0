@@ -886,6 +886,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "trace0-pprof"
+version = "0.1.12"
+dependencies = [
+ "ahash",
+ "prost",
+ "prost-build",
+ "protox",
+ "trace0-core",
+]
+
+[[package]]
 name = "trace0-proto"
 version = "0.1.12"
 dependencies = [
@@ -906,6 +917,7 @@ dependencies = [
  "pyo3",
  "trace0-core",
  "trace0-json",
+ "trace0-pprof",
  "trace0-proto",
 ]
 

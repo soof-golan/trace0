@@ -1,7 +1,7 @@
 from types import TracebackType
 from typing import Literal, Optional
 
-TraceFormat = Literal["json", "protobuf"]
+TraceFormat = Literal["json", "protobuf", "pprof"]
 
 
 class Tracer:

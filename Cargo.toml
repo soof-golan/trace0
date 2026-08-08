@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/json", "crates/proto", "crates/py"]
+members = ["crates/core", "crates/json", "crates/pprof", "crates/proto", "crates/py"]
 
 [workspace.package]
 version = "0.1.12"
@@ -11,6 +11,7 @@ repository = "https://github.com/soof-golan/trace0"
 [workspace.dependencies]
 trace0-core = { path = "crates/core" }
 trace0-json = { path = "crates/json" }
+trace0-pprof = { path = "crates/pprof" }
 trace0-proto = { path = "crates/proto" }
 ahash = "0.8.12"
 quanta = "0.12.6"
