@@ -11,8 +11,6 @@ dump path under ``contexts.trace0.dump``. An unsampled transaction produces
 no event, so it costs nothing.
 """
 
-import time
-
 import sentry_sdk
 from sentry_sdk.integrations import Integration
 from sentry_sdk.scope import add_global_event_processor
@@ -39,11 +37,10 @@ class Trace0Integration(Integration):
             tracer = integration.tracer
             name = event.get("transaction") or "transaction"
             try:
-                anchor = time.time_ns() - tracer.now_ns()
-                start = int(event["start_timestamp"].timestamp() * 1e9) - anchor
-                end = int(event["timestamp"].timestamp() * 1e9) - anchor
                 dump = tracer.snapshot(
-                    f"sentry-{name}", start=max(start, 0), end=max(end, 1)
+                    f"sentry-{name}",
+                    start=int(event["start_timestamp"].timestamp() * 1e9),
+                    end=int(event["timestamp"].timestamp() * 1e9),
                 )
             except RuntimeError:
                 return event

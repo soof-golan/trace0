@@ -21,6 +21,7 @@ pub(crate) struct Running {
     monitoring: Option<MonitoringHandle>,
     exporter: thread::JoinHandle<std::io::Result<()>>,
     pub(crate) control: Option<mpsc::Sender<Control>>,
+    epoch_ns: u64,
 }
 
 static ACTIVE: Mutex<Option<Py<Tracer>>> = Mutex::new(None);
@@ -49,6 +50,10 @@ impl Tracer {
 
     fn start(&self, py: Python<'_>, slot: u32, append: bool) -> PyResult<Running> {
         let queue = Arc::new(EventQueue::new(Clock::starting_now()));
+        let epoch_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+            .as_nanos() as u64;
         let state = Arc::new(State {
             run: queue.id(),
             queue: queue.clone(),
@@ -96,6 +101,7 @@ impl Tracer {
                 monitoring: Some(monitoring),
                 exporter,
                 control,
+                epoch_ns,
             }),
             Err(e) => {
                 queue.close();
@@ -112,6 +118,7 @@ impl Tracer {
             monitoring,
             exporter,
             control,
+            epoch_ns: _,
         } = running;
 
         let disabled = match &monitoring {
@@ -432,10 +439,12 @@ impl Tracer {
                 };
                 Ok(Py::new(py, snapshot)?.into_any())
             }
-            (Some(start_ns), Some(end_ns)) => {
+            (Some(start_epoch_ns), Some(end_epoch_ns)) => {
                 let (done, written) = mpsc::channel();
                 me.with_recorder(|running, control| {
                     let clock = running.queue.clock();
+                    let start_ns = start_epoch_ns.saturating_sub(running.epoch_ns);
+                    let end_ns = end_epoch_ns.saturating_sub(running.epoch_ns);
                     control
                         .send(Control::Dump {
                             id: next_window(),
@@ -465,14 +474,5 @@ impl Tracer {
                 .map_err(|_| PyRuntimeError::new_err("the recorder is gone"))
         })?;
         await_dump(py, written)
-    }
-
-    fn now_ns(&self) -> PyResult<u64> {
-        let guard = self.running.lock();
-        let running = guard
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("the tracer is not running"))?;
-        let clock = running.queue.clock();
-        Ok(clock.ns_since_start(clock.raw()))
     }
 }

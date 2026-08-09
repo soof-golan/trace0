@@ -10,6 +10,7 @@ so a crash or a plain exit still leaves the recent past on disk.
 import gc
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -132,13 +133,23 @@ def test_dump_writes_the_whole_ring_on_demand(tmp_path: Path):
     assert "after_marker" not in names
 
 
-def test_a_past_slice_dumps_by_nanosecond_bounds(tmp_path: Path):
+def test_a_past_slice_dumps_by_epoch_bounds(tmp_path: Path):
     out = tmp_path / "dumps"
     with recorder(out) as t:
         before_marker()
-        t.snapshot("span", start=0, end=10**15)
+        time.sleep(0.002)
+        start = time.time_ns()
+        time.sleep(0.002)
+        inside_marker()
+        time.sleep(0.002)
+        end = time.time_ns()
+        time.sleep(0.002)
+        after_marker()
+        t.snapshot("span", start=start, end=end)
     names = slice_names(load(dumps_named(out, "span")[0]))
-    assert "before_marker" in names
+    assert "inside_marker" in names
+    assert "before_marker" not in names
+    assert "after_marker" not in names
 
 
 def test_a_snapshot_block_reports_its_dump_path(tmp_path: Path):
@@ -154,8 +165,9 @@ def test_a_snapshot_block_reports_its_dump_path(tmp_path: Path):
 def test_a_past_slice_returns_its_dump_path(tmp_path: Path):
     out = tmp_path / "dumps"
     with recorder(out) as t:
+        start = time.time_ns()
         before_marker()
-        path = t.snapshot("span", start=0, end=10**15)
+        path = t.snapshot("span", start=start, end=time.time_ns())
     assert Path(path) == dumps_named(out, "span")[0]
 
 
@@ -165,19 +177,6 @@ def test_dump_returns_its_path(tmp_path: Path):
         before_marker()
         path = t.dump("manual")
     assert Path(path) == dumps_named(out, "manual")[0]
-
-
-def test_now_ns_moves_forward_while_the_tracer_runs(tmp_path: Path):
-    with Tracer(str(tmp_path / "t.json"), format="json") as t:
-        first = t.now_ns()
-        second = t.now_ns()
-    assert 0 <= first <= second
-
-
-def test_now_ns_refuses_when_the_tracer_is_not_running(tmp_path: Path):
-    t = Tracer(str(tmp_path / "t.json"), format="json")
-    with pytest.raises(RuntimeError):
-        t.now_ns()
 
 
 def test_a_streaming_tracer_refuses_snapshots(tmp_path: Path):

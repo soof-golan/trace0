@@ -10,8 +10,6 @@ Each sampled local-root span gets a dump of its own time window, named
 Ended spans are read-only, so the name is the only link.
 """
 
-import time
-
 from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor
 
 from trace0 import Tracer
@@ -28,11 +26,10 @@ class Trace0SpanProcessor(SpanProcessor):
             return
         ctx = span.context
         try:
-            anchor = time.time_ns() - self.tracer.now_ns()
             self.tracer.snapshot(
                 f"otel-{ctx.trace_id:032x}-{ctx.span_id:016x}",
-                start=max(span.start_time - anchor, 0),
-                end=max(span.end_time - anchor, 1),
+                start=span.start_time,
+                end=span.end_time,
             )
         except RuntimeError:
             pass
