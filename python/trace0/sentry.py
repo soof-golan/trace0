@@ -5,11 +5,13 @@ Usage::
     tracer = Tracer("dumps/", record_last_mb=64).__enter__()
     sentry_sdk.init(..., integrations=[Trace0Integration(tracer)])
 
-Each transaction that Sentry itself sampled for profiling (per
-``profiles_sample_rate`` or ``profiles_sampler``) gets a dump of its own
-time window, and the event carries the dump path under
-``contexts.trace0.dump``. The integration reads Sentry's per-transaction
-decision; it never rolls its own.
+Each transaction that Sentry itself profiles gets a dump of its own time
+window, and the event carries the dump path under ``contexts.trace0.dump``.
+The integration reads Sentry's own decision and never rolls its own: a
+continuous-profiler session marks its transactions with
+``contexts.profile.profiler_id``, and the transaction profiler
+(``profiles_sample_rate`` / ``profiles_sampler``) records its roll on the
+transaction's profile object.
 """
 
 import time
@@ -22,6 +24,8 @@ from trace0 import Tracer
 
 
 def profiled(event) -> bool:
+    if "profiler_id" in event.get("contexts", {}).get("profile", {}):
+        return True
     profile = event.get("profile")
     if profile is not None:
         return bool(profile.sampled)
