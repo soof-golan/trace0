@@ -5,13 +5,10 @@ Usage::
     tracer = Tracer("dumps/", record_last_mb=64).__enter__()
     sentry_sdk.init(..., integrations=[Trace0Integration(tracer)])
 
-Each transaction that Sentry itself profiles gets a dump of its own time
-window, and the event carries the dump path under ``contexts.trace0.dump``.
-The integration reads Sentry's own decision and never rolls its own: a
-continuous-profiler session marks its transactions with
-``contexts.profile.profiler_id``, and the transaction profiler
-(``profiles_sample_rate`` / ``profiles_sampler``) records its roll on the
-transaction's profile object.
+trace0 is a tracer, so it follows Sentry's tracing decision: every sampled
+transaction gets a dump of its own time window, and the event carries the
+dump path under ``contexts.trace0.dump``. An unsampled transaction produces
+no event, so it costs nothing.
 """
 
 import time
@@ -21,20 +18,6 @@ from sentry_sdk.integrations import Integration
 from sentry_sdk.scope import add_global_event_processor
 
 from trace0 import Tracer
-
-
-def profiled(event) -> bool:
-    if "profiler_id" in event.get("contexts", {}).get("profile", {}):
-        return True
-    profile = event.get("profile")
-    if profile is not None:
-        return bool(profile.sampled)
-    transaction = sentry_sdk.get_current_scope().transaction
-    if transaction is None or transaction._profile is None:
-        return False
-    if transaction.span_id != event["contexts"]["trace"]["span_id"]:
-        return False
-    return bool(transaction._profile.sampled)
 
 
 class Trace0Integration(Integration):
@@ -52,8 +35,6 @@ class Trace0Integration(Integration):
             client = sentry_sdk.get_client()
             integration = client.get_integration(Trace0Integration)
             if integration is None:
-                return event
-            if not profiled(event):
                 return event
             tracer = integration.tracer
             name = event.get("transaction") or "transaction"
