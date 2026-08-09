@@ -411,17 +411,12 @@ impl Tracer {
         slf: &Bound<'_, Self>,
         py: Python<'_>,
         reason: String,
-    ) -> PyResult<Py<crate::recording::Snapshot>> {
+    ) -> PyResult<Py<crate::recording::SnapshotBlock>> {
         let me = slf.get();
         me.with_recorder(|_, _| Ok(()))?;
         Py::new(
             py,
-            crate::recording::Snapshot {
-                tracer: slf.clone().unbind(),
-                reason,
-                window: Mutex::new(None),
-                written: Mutex::new(None),
-            },
+            crate::recording::SnapshotBlock::new(slf.clone().unbind(), reason),
         )
     }
 }

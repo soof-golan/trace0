@@ -36,18 +36,19 @@ class Trace0Integration(Integration):
             if integration is None or not getattr(transaction, "sampled", None):
                 return transaction
             try:
-                snapshot = integration.tracer.snapshot(f"sentry-{transaction.name}")
+                block = integration.tracer.snapshot(f"sentry-{transaction.name}")
             except RuntimeError:
                 return transaction
-            integration.open[transaction.span_id] = snapshot.__enter__()
+            integration.open[transaction.span_id] = (block, block.__enter__())
             return transaction
 
         def finish_the_snapshot(transaction, *args, **kwargs):
             integration = sentry_sdk.get_client().get_integration(Trace0Integration)
             if integration is not None:
-                snapshot = integration.open.pop(transaction.span_id, None)
-                if snapshot is not None:
-                    snapshot.__exit__(None, None, None)
+                opened = integration.open.pop(transaction.span_id, None)
+                if opened is not None:
+                    block, snapshot = opened
+                    block.__exit__(None, None, None)
                     transaction.set_context("trace0", {"dump": snapshot.path})
             return finish(transaction, *args, **kwargs)
 

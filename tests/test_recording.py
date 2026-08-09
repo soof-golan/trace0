@@ -125,18 +125,42 @@ def test_a_snapshot_block_reports_its_dump_path(tmp_path: Path):
     out = tmp_path / "dumps"
     with recorder(out) as t:
         with t.snapshot("checkout") as snap:
-            assert snap.path is None
             inside_marker()
-    assert snap.path is not None
     assert Path(snap.path) == dumps_named(out, "checkout")[0]
+
+
+def test_an_unentered_block_has_no_path(tmp_path: Path):
+    out = tmp_path / "dumps"
+    with recorder(out) as t:
+        block = t.snapshot("pending")
+        assert not hasattr(block, "path")
+
+
+def test_an_open_snapshot_refuses_its_path(tmp_path: Path):
+    out = tmp_path / "dumps"
+    with recorder(out) as t:
+        with t.snapshot("open") as snap:
+            with pytest.raises(RuntimeError):
+                snap.path
 
 
 def test_a_snapshot_is_immutable(tmp_path: Path):
     out = tmp_path / "dumps"
     with recorder(out) as t:
-        snap = t.snapshot("frozen")
+        with t.snapshot("frozen") as snap:
+            inside_marker()
         with pytest.raises(AttributeError):
             snap.path = "elsewhere"
+
+
+def test_a_snapshot_block_is_single_use(tmp_path: Path):
+    out = tmp_path / "dumps"
+    with recorder(out) as t:
+        block = t.snapshot("once")
+        with block:
+            inside_marker()
+        with pytest.raises(RuntimeError):
+            block.__enter__()
 
 
 def test_a_streaming_tracer_refuses_snapshots(tmp_path: Path):

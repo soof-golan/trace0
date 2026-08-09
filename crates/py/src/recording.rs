@@ -66,31 +66,79 @@ impl DumpSink for DirSink {
 
 #[pyclass(module = "trace0._core", frozen)]
 pub struct Snapshot {
-    pub(crate) tracer: Py<Tracer>,
-    pub(crate) reason: String,
-    pub(crate) window: Mutex<Option<(u64, u64)>>,
-    pub(crate) written: Mutex<Option<String>>,
+    written: Mutex<Option<String>>,
 }
 
 #[pymethods]
 impl Snapshot {
     #[getter]
-    fn path(&self) -> Option<String> {
-        self.written.lock().clone()
+    fn path(&self) -> PyResult<String> {
+        self.written
+            .lock()
+            .clone()
+            .ok_or_else(|| PyRuntimeError::new_err("the snapshot block is still open"))
     }
+}
 
-    fn __enter__<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, Self>> {
-        let me = slf.get();
-        me.tracer.get().with_recorder(|running, control| {
+enum Stage {
+    Ready,
+    Open {
+        id: u64,
+        start_ticks: u64,
+        result: Py<Snapshot>,
+    },
+    Done,
+}
+
+#[pyclass(module = "trace0._core", frozen)]
+pub struct SnapshotBlock {
+    tracer: Py<Tracer>,
+    reason: String,
+    stage: Mutex<Stage>,
+}
+
+impl SnapshotBlock {
+    pub(crate) fn new(tracer: Py<Tracer>, reason: String) -> Self {
+        Self {
+            tracer,
+            reason,
+            stage: Mutex::new(Stage::Ready),
+        }
+    }
+}
+
+#[pymethods]
+impl SnapshotBlock {
+    fn __enter__(&self, py: Python<'_>) -> PyResult<Py<Snapshot>> {
+        let mut stage = self.stage.lock();
+        match &*stage {
+            Stage::Ready => {}
+            Stage::Open { .. } | Stage::Done => {
+                return Err(PyRuntimeError::new_err(
+                    "a snapshot block runs exactly once",
+                ));
+            }
+        }
+        let result = Py::new(
+            py,
+            Snapshot {
+                written: Mutex::new(None),
+            },
+        )?;
+        self.tracer.get().with_recorder(|running, control| {
             let id = next_window();
             let start_ticks = running.queue.clock().raw();
             control
                 .send(Control::Open { id, start_ticks })
                 .map_err(|_| PyRuntimeError::new_err("the recorder is gone"))?;
-            *me.window.lock() = Some((id, start_ticks));
+            *stage = Stage::Open {
+                id,
+                start_ticks,
+                result: result.clone_ref(py),
+            };
             Ok(())
         })?;
-        Ok(slf.clone())
+        Ok(result)
     }
 
     fn __exit__(
@@ -100,7 +148,22 @@ impl Snapshot {
         _exc_val: Option<Bound<'_, PyAny>>,
         _exc_tb: Option<Bound<'_, PyAny>>,
     ) -> PyResult<bool> {
-        let Some((id, start_ticks)) = self.window.lock().take() else {
+        let opened = {
+            let mut stage = self.stage.lock();
+            match std::mem::replace(&mut *stage, Stage::Done) {
+                Stage::Open {
+                    id,
+                    start_ticks,
+                    result,
+                } => Some((id, start_ticks, result)),
+                Stage::Ready => {
+                    *stage = Stage::Ready;
+                    None
+                }
+                Stage::Done => None,
+            }
+        };
+        let Some((id, start_ticks, result)) = opened else {
             return Ok(false);
         };
         let reason = match &exc_type {
@@ -126,7 +189,7 @@ impl Snapshot {
         let path = py
             .detach(move || done_rx.recv())
             .map_err(|_| PyRuntimeError::new_err("the recorder did not finish the dump"))?;
-        *self.written.lock() = Some(path);
+        *result.get().written.lock() = Some(path);
         Ok(false)
     }
 }

@@ -5,9 +5,11 @@ TraceFormat = Literal["json", "protobuf", "pprof"]
 
 
 class Snapshot:
-    path: Optional[str]
+    path: str
 
-    def __enter__(self) -> "Snapshot": ...
+
+class SnapshotBlock:
+    def __enter__(self) -> Snapshot: ...
     def __exit__(
         self,
         exc_type: Optional[type[BaseException]],
@@ -33,7 +35,7 @@ class Tracer:
         exc_tb: Optional[TracebackType],
     ) -> bool: ...
 
-    def snapshot(self, reason: str) -> Snapshot: ...
+    def snapshot(self, reason: str) -> SnapshotBlock: ...
 
 
 def cli_main(argv: list[str]) -> int: ...

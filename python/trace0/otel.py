@@ -29,15 +29,14 @@ class Trace0SpanProcessor(SpanProcessor):
         if not ctx.trace_flags.sampled or not local_root(span):
             return
         try:
-            snapshot = self.tracer.snapshot(
-                f"otel-{ctx.trace_id:032x}-{ctx.span_id:016x}"
-            )
+            block = self.tracer.snapshot(f"otel-{ctx.trace_id:032x}-{ctx.span_id:016x}")
         except RuntimeError:
             return
-        self.open[(ctx.trace_id, ctx.span_id)] = snapshot.__enter__()
+        block.__enter__()
+        self.open[(ctx.trace_id, ctx.span_id)] = block
 
     def on_end(self, span: ReadableSpan):
         ctx = span.context
-        snapshot = self.open.pop((ctx.trace_id, ctx.span_id), None)
-        if snapshot is not None:
-            snapshot.__exit__(None, None, None)
+        block = self.open.pop((ctx.trace_id, ctx.span_id), None)
+        if block is not None:
+            block.__exit__(None, None, None)
