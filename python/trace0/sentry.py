@@ -6,9 +6,9 @@ Usage::
     sentry_sdk.init(..., integrations=[Trace0Integration(tracer)])
 
 trace0 is a tracer, so it follows Sentry's tracing decision: every sampled
-transaction runs inside a snapshot block, and the transaction event carries
-the dump path under ``contexts.trace0.dump``. An unsampled transaction
-opens no snapshot, so it costs nothing.
+transaction runs inside a snapshot block, and the dump file travels with the
+transaction envelope as an attachment. An unsampled transaction opens no
+snapshot, so it costs nothing.
 """
 
 import sentry_sdk
@@ -44,13 +44,16 @@ class Trace0Integration(Integration):
 
         def finish_the_snapshot(transaction, *args, **kwargs):
             integration = sentry_sdk.get_client().get_integration(Trace0Integration)
+            opened = None
             if integration is not None:
                 opened = integration.open.pop(transaction.span_id, None)
-                if opened is not None:
-                    block, snapshot = opened
-                    block.__exit__(None, None, None)
-                    transaction.set_context("trace0", {"dump": snapshot.path})
-            return finish(transaction, *args, **kwargs)
+            if opened is None:
+                return finish(transaction, *args, **kwargs)
+            block, snapshot = opened
+            block.__exit__(None, None, None)
+            with sentry_sdk.new_scope() as scope:
+                scope.add_attachment(path=snapshot.path, add_to_transactions=True)
+                return finish(transaction, *args, **kwargs)
 
         sentry_sdk.Scope.start_transaction = start_inside_a_snapshot
         Transaction.finish = finish_the_snapshot
