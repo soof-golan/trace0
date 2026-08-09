@@ -6,14 +6,14 @@ Usage::
     sentry_sdk.init(..., integrations=[Trace0Integration(tracer)])
 
 trace0 is a tracer, so it follows Sentry's tracing decision: every sampled
-transaction gets a dump of its own time window, and the event carries the
-dump path under ``contexts.trace0.dump``. An unsampled transaction produces
-no event, so it costs nothing.
+transaction runs inside a snapshot block, and the transaction event carries
+the dump path under ``contexts.trace0.dump``. An unsampled transaction
+opens no snapshot, so it costs nothing.
 """
 
 import sentry_sdk
 from sentry_sdk.integrations import Integration
-from sentry_sdk.scope import add_global_event_processor
+from sentry_sdk.tracing import Transaction
 
 from trace0 import Tracer
 
@@ -23,26 +23,33 @@ class Trace0Integration(Integration):
 
     def __init__(self, tracer: Tracer):
         self.tracer = tracer
+        self.open = {}
 
     @staticmethod
     def setup_once():
-        @add_global_event_processor
-        def attach_snapshot(event, hint):
-            if event.get("type") != "transaction":
-                return event
-            client = sentry_sdk.get_client()
-            integration = client.get_integration(Trace0Integration)
-            if integration is None:
-                return event
-            tracer = integration.tracer
-            name = event.get("transaction") or "transaction"
+        start_transaction = sentry_sdk.Scope.start_transaction
+        finish = Transaction.finish
+
+        def start_inside_a_snapshot(scope, *args, **kwargs):
+            transaction = start_transaction(scope, *args, **kwargs)
+            integration = sentry_sdk.get_client().get_integration(Trace0Integration)
+            if integration is None or not getattr(transaction, "sampled", None):
+                return transaction
             try:
-                dump = tracer.snapshot(
-                    f"sentry-{name}",
-                    start=int(event["start_timestamp"].timestamp() * 1e9),
-                    end=int(event["timestamp"].timestamp() * 1e9),
-                )
+                snapshot = integration.tracer.snapshot(f"sentry-{transaction.name}")
             except RuntimeError:
-                return event
-            event.setdefault("contexts", {})["trace0"] = {"dump": dump}
-            return event
+                return transaction
+            integration.open[transaction.span_id] = snapshot.__enter__()
+            return transaction
+
+        def finish_the_snapshot(transaction, *args, **kwargs):
+            integration = sentry_sdk.get_client().get_integration(Trace0Integration)
+            if integration is not None:
+                snapshot = integration.open.pop(transaction.span_id, None)
+                if snapshot is not None:
+                    snapshot.__exit__(None, None, None)
+                    transaction.set_context("trace0", {"dump": snapshot.path})
+            return finish(transaction, *args, **kwargs)
+
+        sentry_sdk.Scope.start_transaction = start_inside_a_snapshot
+        Transaction.finish = finish_the_snapshot

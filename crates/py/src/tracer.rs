@@ -1,7 +1,7 @@
 use crate::format::Format;
 use crate::intern::Interner;
 use crate::monitoring::{self, MonitoringHandle, State};
-use crate::recording::{DirSink, next_window};
+use crate::recording::DirSink;
 use crate::threads::ThreadRegistry;
 use parking_lot::Mutex;
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
@@ -21,7 +21,6 @@ pub(crate) struct Running {
     monitoring: Option<MonitoringHandle>,
     exporter: thread::JoinHandle<std::io::Result<()>>,
     pub(crate) control: Option<mpsc::Sender<Control>>,
-    epoch_ns: u64,
 }
 
 static ACTIVE: Mutex<Option<Py<Tracer>>> = Mutex::new(None);
@@ -50,10 +49,6 @@ impl Tracer {
 
     fn start(&self, py: Python<'_>, slot: u32, append: bool) -> PyResult<Running> {
         let queue = Arc::new(EventQueue::new(Clock::starting_now()));
-        let epoch_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-            .as_nanos() as u64;
         let state = Arc::new(State {
             run: queue.id(),
             queue: queue.clone(),
@@ -101,7 +96,6 @@ impl Tracer {
                 monitoring: Some(monitoring),
                 exporter,
                 control,
-                epoch_ns,
             }),
             Err(e) => {
                 queue.close();
@@ -118,7 +112,6 @@ impl Tracer {
             monitoring,
             exporter,
             control,
-            epoch_ns: _,
         } = running;
 
         let disabled = match &monitoring {
@@ -161,11 +154,6 @@ impl Tracer {
         })?;
         f(running, control)
     }
-}
-
-fn await_dump(py: Python<'_>, written: mpsc::Receiver<String>) -> PyResult<String> {
-    py.detach(move || written.recv())
-        .map_err(|_| PyRuntimeError::new_err("the recorder did not finish the dump"))
 }
 
 const CHILD_OUTPUT: &str = "TRACE0_CHILD_OUTPUT";
@@ -419,60 +407,21 @@ impl Tracer {
         Ok(false)
     }
 
-    #[pyo3(signature = (reason, start = None, end = None))]
     fn snapshot(
         slf: &Bound<'_, Self>,
         py: Python<'_>,
         reason: String,
-        start: Option<u64>,
-        end: Option<u64>,
-    ) -> PyResult<Py<PyAny>> {
+    ) -> PyResult<Py<crate::recording::Snapshot>> {
         let me = slf.get();
-        match (start, end) {
-            (None, None) => {
-                me.with_recorder(|_, _| Ok(()))?;
-                let snapshot = crate::recording::Snapshot {
-                    tracer: slf.clone().unbind(),
-                    reason,
-                    window: Mutex::new(None),
-                    written: Mutex::new(None),
-                };
-                Ok(Py::new(py, snapshot)?.into_any())
-            }
-            (Some(start_epoch_ns), Some(end_epoch_ns)) => {
-                let (done, written) = mpsc::channel();
-                me.with_recorder(|running, control| {
-                    let clock = running.queue.clock();
-                    let start_ns = start_epoch_ns.saturating_sub(running.epoch_ns);
-                    let end_ns = end_epoch_ns.saturating_sub(running.epoch_ns);
-                    control
-                        .send(Control::Dump {
-                            id: next_window(),
-                            start_ticks: clock.ticks_from_ns(start_ns),
-                            end_ticks: clock.ticks_from_ns(end_ns),
-                            reason,
-                            done: Some(done),
-                        })
-                        .map_err(|_| PyRuntimeError::new_err("the recorder is gone"))
-                })?;
-                let path = await_dump(py, written)?;
-                Ok(path.into_pyobject(py)?.into_any().unbind())
-            }
-            _ => Err(PyValueError::new_err("start and end come together")),
-        }
-    }
-
-    fn dump(&self, py: Python<'_>, reason: String) -> PyResult<String> {
-        let (done, written) = mpsc::channel();
-        self.with_recorder(|running, control| {
-            control
-                .send(Control::DumpAll {
-                    end_ticks: running.queue.clock().raw(),
-                    reason,
-                    done: Some(done),
-                })
-                .map_err(|_| PyRuntimeError::new_err("the recorder is gone"))
-        })?;
-        await_dump(py, written)
+        me.with_recorder(|_, _| Ok(()))?;
+        Py::new(
+            py,
+            crate::recording::Snapshot {
+                tracer: slf.clone().unbind(),
+                reason,
+                window: Mutex::new(None),
+                written: Mutex::new(None),
+            },
+        )
     }
 }

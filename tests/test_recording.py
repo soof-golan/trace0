@@ -10,7 +10,6 @@ so a crash or a plain exit still leaves the recent past on disk.
 import gc
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -122,36 +121,6 @@ def test_an_escaping_exception_tags_the_final_dump(tmp_path: Path):
     assert dumps_named(out, "exit") == []
 
 
-def test_dump_writes_the_whole_ring_on_demand(tmp_path: Path):
-    out = tmp_path / "dumps"
-    with recorder(out) as t:
-        before_marker()
-        t.dump("manual")
-        after_marker()
-    names = slice_names(load(dumps_named(out, "manual")[0]))
-    assert "before_marker" in names
-    assert "after_marker" not in names
-
-
-def test_a_past_slice_dumps_by_epoch_bounds(tmp_path: Path):
-    out = tmp_path / "dumps"
-    with recorder(out) as t:
-        before_marker()
-        time.sleep(0.002)
-        start = time.time_ns()
-        time.sleep(0.002)
-        inside_marker()
-        time.sleep(0.002)
-        end = time.time_ns()
-        time.sleep(0.002)
-        after_marker()
-        t.snapshot("span", start=start, end=end)
-    names = slice_names(load(dumps_named(out, "span")[0]))
-    assert "inside_marker" in names
-    assert "before_marker" not in names
-    assert "after_marker" not in names
-
-
 def test_a_snapshot_block_reports_its_dump_path(tmp_path: Path):
     out = tmp_path / "dumps"
     with recorder(out) as t:
@@ -162,44 +131,24 @@ def test_a_snapshot_block_reports_its_dump_path(tmp_path: Path):
     assert Path(snap.path) == dumps_named(out, "checkout")[0]
 
 
-def test_a_past_slice_returns_its_dump_path(tmp_path: Path):
+def test_a_snapshot_is_immutable(tmp_path: Path):
     out = tmp_path / "dumps"
     with recorder(out) as t:
-        start = time.time_ns()
-        before_marker()
-        path = t.snapshot("span", start=start, end=time.time_ns())
-    assert Path(path) == dumps_named(out, "span")[0]
-
-
-def test_dump_returns_its_path(tmp_path: Path):
-    out = tmp_path / "dumps"
-    with recorder(out) as t:
-        before_marker()
-        path = t.dump("manual")
-    assert Path(path) == dumps_named(out, "manual")[0]
+        snap = t.snapshot("frozen")
+        with pytest.raises(AttributeError):
+            snap.path = "elsewhere"
 
 
 def test_a_streaming_tracer_refuses_snapshots(tmp_path: Path):
     with Tracer(str(tmp_path / "t.json"), format="json") as t:
         with pytest.raises(RuntimeError):
             t.snapshot("nope")
-        with pytest.raises(RuntimeError):
-            t.dump("nope")
 
 
 def test_a_recorder_that_is_not_running_refuses_snapshots(tmp_path: Path):
     t = Tracer(str(tmp_path / "dumps"), format="json", record_last_mb=64)
     with pytest.raises(RuntimeError):
         t.snapshot("early")
-    with pytest.raises(RuntimeError):
-        t.dump("early")
-
-
-def test_half_a_nanosecond_range_is_rejected(tmp_path: Path):
-    out = tmp_path / "dumps"
-    with recorder(out) as t:
-        with pytest.raises(ValueError):
-            t.snapshot("x", start=5)
 
 
 def test_the_cli_records_when_asked(tmp_path: Path):
@@ -251,7 +200,8 @@ def test_code_churn_beyond_the_id_space_keeps_tracing(tmp_path: Path, monkeypatc
         gc.collect()
         for _ in range(200_000):
             filler_step()
-        t.dump("advance")
+        with t.snapshot("advance"):
+            filler_step()
         with t.snapshot("fresh"):
             fresh_marker()
     names = slice_names(load(dumps_named(out, "fresh")[0]))
